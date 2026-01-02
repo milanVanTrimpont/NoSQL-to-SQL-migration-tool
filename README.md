@@ -104,11 +104,13 @@ The code is modularized within a single file:<br />
 
 ## Sources
 The following sources were used during development: <br />
-Claude and Chatgpt for the datamigration, validation and sync <br />
+__Claude and Chatgpt__ for the data migration, validation and sync <br />
 __github copilot__ for errorhandeling<br />
 
-__DB connection:__ https://medium.com/@kavindra.mpez/database-automation-powershell-connectivity-with-mysql-ado-net-provider-powershell-cmdlets-b1c4f528eeab
+__DB connection:__ https://medium.com/@kavindra.mpez/database-automation-powershell-connectivity-with-mysql-ado-net-provider-powershell-cmdlets-b1c4f528eeab<br />
 __Pester test:__ <br />
 https://pester.dev/docs/quick-start <br />
 https://www.youtube.com/watch?v=iWbemnUpGx4<br />
-
+__Extra__<br />
+https://learn.microsoft.com/en-us/powershell/<br />
+https://learn.microsoft.com/en-us/powershell/scripting/developer/module/how-to-write-a-powershell-module-manifest?view=powershell-7.5<br />
