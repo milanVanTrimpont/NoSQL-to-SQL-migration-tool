@@ -1,1 +1,0 @@
-# NoSQL-to-SQL-migration-tool
