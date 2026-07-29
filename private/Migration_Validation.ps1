@@ -5,7 +5,7 @@ function Test-MigrationValidation {
     
     .DESCRIPTION
     Performs comprehensive validation of migrated data:
-    - Compares record counts between source and destination
+    - Compares record counts betweaen source and destination
     - Validates sample data integrity
     - Checks for data type consistency
     - Generates detailed validation report

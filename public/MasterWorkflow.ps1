@@ -185,6 +185,11 @@ function Invoke-MigrationWorkflow {
 
 function Get-MongoDBCollections {
     try {
+        # Get config if not already loaded
+        if (-not $script:AppConfig) {
+            $script:AppConfig = Get-AppConfig
+        }
+        
         Connect-Mdbc -ConnectionString $script:AppConfig.MongoDB.ConnectionString `
                      -DatabaseName $script:AppConfig.MongoDB.Database
 

@@ -404,39 +404,30 @@ function Start-MigrationTool {
     Write-Host "║                                                            ║" -ForegroundColor Cyan
     Write-Host "╚════════════════════════════════════════════════════════════╝" -ForegroundColor Cyan
     Write-Host ""
-    Write-Host "Loading modules..." -ForegroundColor Yellow
+    Write-Host "Loading module..." -ForegroundColor Yellow
     
-    # Check if all modules are loaded
-    $modules = @(
-        "Connection_DB.ps1",
-        "Analyze_scheme.ps1",
-        "sql_schema-generator.ps1",
-        "data-migration.ps1",
-        "sync.ps1",
-        "migration-validation.ps1",
-        "MasterWorkflow.ps1"
-    )
+    # Import the module
+    $modulePath = Join-Path $PSScriptRoot "NoSqlToSqlMigration\NoSqlToSqlMigration.psd1"
     
-    $allLoaded = $true
-    foreach ($module in $modules) {
-        if (Test-Path $module) {
-            . ".\$module"
-            Write-Host " Loaded $module" -ForegroundColor Green
-        }
-        else {
-            Write-Host " Missing $module" -ForegroundColor Red
-            $allLoaded = $false
-        }
-    }
-    
-    if (-not $allLoaded) {
-        Write-Host "`n Some modules are missing. Please ensure all files are present." -ForegroundColor Red
+    if (-not (Test-Path $modulePath)) {
+        Write-Host " Module not found at: $modulePath" -ForegroundColor Red
+        Write-Host " Please ensure the NoSqlToSqlMigration module is present." -ForegroundColor Red
         return
     }
     
-    Write-Host "`n All modules loaded successfully!" -ForegroundColor Green
-    Start-Sleep -Seconds 1
+    try {
+        Import-Module $modulePath -Force -ErrorAction Stop
+        Write-Host " Module loaded successfully!" -ForegroundColor Green
+        Start-Sleep -Seconds 1
+    }
+    catch {
+        Write-Host " Failed to load module: $($_.Exception.Message)" -ForegroundColor Red
+        return
+    }
     
     # Start interactive menu
     Start-MigrationToolMenu
 }
+
+# Run the tool when script is executed
+Start-MigrationTool

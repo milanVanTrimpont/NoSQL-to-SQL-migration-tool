@@ -112,7 +112,7 @@ function Menu-DiscoverCollections {
     
     Write-Host "`nScanning database..." -ForegroundColor Yellow
     
-    $collections = Get-MongoDBCollections
+    [string[]]$collections = @(Get-MdbcCollection)
     
     if ($collections.Count -eq 0) {
         Write-Host "`n No collections found!" -ForegroundColor Red
@@ -145,7 +145,7 @@ function Menu-MigrateSingle {
     Write-Host "Migrate Single Collection" -ForegroundColor Cyan
     Write-Host ("="*60) -ForegroundColor Cyan
     
-    $collections = Get-MongoDBCollections
+    [string[]]$collections = @(Get-MdbcCollection)
     
     if ($collections.Count -eq 0) {
         Write-Host "`n No collections found!" -ForegroundColor Red
@@ -185,7 +185,7 @@ function Menu-MigrateMultiple {
     Write-Host "Migrate Multiple Collections" -ForegroundColor Cyan
     Write-Host ("="*60) -ForegroundColor Cyan
     
-    $collections = Get-MongoDBCollections
+    [string[]]$collections = @(Get-MdbcCollection)
     
     if ($collections.Count -eq 0) {
         Write-Host "`n No collections found!" -ForegroundColor Red
@@ -234,7 +234,7 @@ function Menu-MigrateAll {
     Write-Host "Migrate ALL Collections" -ForegroundColor Cyan
     Write-Host ("="*60) -ForegroundColor Cyan
     
-    $collections = Get-MongoDBCollections
+    [string[]]$collections = @(Get-MdbcCollection)
     
     if ($collections.Count -eq 0) {
         Write-Host "`n No collections found!" -ForegroundColor Red
@@ -262,7 +262,7 @@ function Menu-SyncSingle {
     Write-Host "Sync Single Collection (Incremental)" -ForegroundColor Cyan
     Write-Host ("="*60) -ForegroundColor Cyan
     
-    $collections = Get-MongoDBCollections
+    [string[]]$collections = @(Get-MdbcCollection)
     
     if ($collections.Count -eq 0) {
         Write-Host "`n No collections found!" -ForegroundColor Red
@@ -296,7 +296,7 @@ function Menu-SyncAll {
     Write-Host "Sync ALL Collections" -ForegroundColor Cyan
     Write-Host ("="*60) -ForegroundColor Cyan
     
-    $collections = Get-MongoDBCollections
+    [string[]]$collections = @(Get-MdbcCollection)
     
     if ($collections.Count -eq 0) {
         Write-Host "`n No collections found!" -ForegroundColor Red
@@ -324,7 +324,7 @@ function Menu-ValidateSingle {
     Write-Host "Validate Single Collection" -ForegroundColor Cyan
     Write-Host ("="*60) -ForegroundColor Cyan
     
-    $collections = Get-MongoDBCollections
+    [string[]]$collections = @(Get-MdbcCollection)
     
     if ($collections.Count -eq 0) {
         Write-Host "`n No collections found!" -ForegroundColor Red
@@ -362,7 +362,7 @@ function Menu-SchemaOnly {
     Write-Host "Analyze Schema Only" -ForegroundColor Cyan
     Write-Host ("="*60) -ForegroundColor Cyan
     
-    $collections = Get-MongoDBCollections
+    [string[]]$collections = @(Get-MdbcCollection)
     
     if ($collections.Count -eq 0) {
         Write-Host "`n No collections found!" -ForegroundColor Red

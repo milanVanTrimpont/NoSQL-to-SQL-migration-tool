@@ -1,10 +1,18 @@
-    # ============================================================
-    # Configuration Loader - Zie Config.ps1
-    # ============================================================
+<#
+.SYNOPSIS
+Database Connection Initialization and Testing
+.DESCRIPTION
+The script:
+- Loads database configuration settings via a configuration loader (Get-AppConfig)
+- Tests the connection to MongoDB (optionally including a collection)
+- Tests the connection to MySQL or SQL Server
+- Provides clear status and error messages in the console
+- Initializes and validates all required database connections
+- Returns reusable SQL connection objects for subsequent operations
 
-    # ============================================================
-    # MongoDB Connection Test
-    # ============================================================
+.FUNCTIONALITY
+To ensure that all database connections are correctly configured and operational before executing migration or data processing steps.
+#>
 
     function Test-MongoDBConnection {
         param (
@@ -55,10 +63,8 @@
         }
     }
 
-    # ============================================================
+    
     # MySQL Connection Test
-    # ============================================================
-
     function Test-MySQLConnection {
         param (
             [Parameter(Mandatory)]
@@ -111,10 +117,8 @@
         }
     }
 
-    # ============================================================
+    
     # SQL Server Connection Test
-    # ============================================================
-
     function Test-SQLServerConnection {
         param (
             [Parameter(Mandatory)]
@@ -156,10 +160,7 @@
         }
     }
 
-    # ============================================================
     # Initialize All Database Connections
-    # ============================================================
-
     function Initialize-DatabaseConnections {
         param(
             [ValidateSet("MySQL", "SQLServer")]
@@ -216,10 +217,8 @@
         return $false
     }
 
-    # ============================================================
-    # Get SQL Connection Object
-    # ============================================================
 
+    # Get SQL Connection Object
     function Get-SQLConnection {
         param(
             [Parameter(Mandatory)]

@@ -1,0 +1,53 @@
+{
+  "Operation": "FullMigration",
+  "TotalSuccess": 1,
+  "Collections": [
+    {
+      "Success": true,
+      "Details": {
+        "Validation": {
+          "MongoCount": 0,
+          "Warnings": [],
+          "OverallStatus": "ERROR",
+          "SamplesValidated": 0,
+          "ValidationTime": "2026-07-29T15:01:22.996716+02:00",
+          "SamplesPassed": 0,
+          "RecordCountMatch": false,
+          "TableName": "MongoDB.Driver.MongoCollectionImpl`1[MongoDB.Bson.BsonDocument]",
+          "SamplesFailed": 0,
+          "SQLCount": 0,
+          "Details": [],
+          "Issues": [
+            "Validation error: Exception calling \"ExecuteScalar\" with \"0\" argument(s): \"You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near '1[MongoDB.Bson.BsonDocument]`' at line 1\""
+          ]
+        },
+        "SQLSchema": {
+          "Tables": [
+            "MongoDB.Driver.MongoCollectionImpl`1[MongoDB.Bson.BsonDocument]"
+          ],
+          "MainTable": "MongoDB.Driver.MongoCollectionImpl`1[MongoDB.Bson.BsonDocument]",
+          "Statements": [
+            "-- Drop table if exists\nIF OBJECT_ID('MongoDB.Driver.MongoCollectionImpl`1[MongoDB.Bson.BsonDocument]', 'U') IS NOT NULL DROP TABLE MongoDB.Driver.MongoCollectionImpl`1[MongoDB.Bson.BsonDocument];\n\n-- Main table: MongoDB.Driver.MongoCollectionImpl`1[MongoDB.Bson.BsonDocument]\nCREATE TABLE MongoDB.Driver.MongoCollectionImpl`1[MongoDB.Bson.BsonDocument] (\n\n);\n"
+          ],
+          "Relationships": []
+        },
+        "Migration": {
+          "Errors": [],
+          "EndTime": "2026-07-29T15:01:22.9866205+02:00",
+          "TotalDocuments": 0,
+          "MigratedDocuments": 0,
+          "RecordsInserted": {},
+          "TablesCreated": [],
+          "StartTime": "2026-07-29T15:01:22.9497468+02:00",
+          "FailedDocuments": 0
+        },
+        "Schema": {}
+      },
+      "Name": "MongoDB.Driver.MongoCollectionImpl`1[MongoDB.Bson.BsonDocument]",
+      "Error": null
+    }
+  ],
+  "EndTime": "2026-07-29T15:01:23.0211216+02:00",
+  "StartTime": "2026-07-29T15:01:22.9036914+02:00",
+  "TotalFailed": 0
+}
