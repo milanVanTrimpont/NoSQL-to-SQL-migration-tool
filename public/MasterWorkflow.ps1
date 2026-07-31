@@ -62,7 +62,7 @@ function Invoke-MigrationWorkflow {
     # Get collections to process
     if ($Collections.Count -eq 0) {
         Write-Host "Discovering collections..." -ForegroundColor Yellow
-        $discoveredCollections = Get-MongoDBCollections
+        $discoveredCollections = @(Get-MongoDBCollections)
         
         if ($discoveredCollections.Count -eq 0) {
             Write-Host "No collections found in database." -ForegroundColor Red

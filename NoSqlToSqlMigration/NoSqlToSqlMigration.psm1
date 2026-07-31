@@ -168,6 +168,8 @@ function Analyze-DocumentStructure {
                 IsArray = $false
                 SampleValues = @()
                 ArrayElementTypes = @{}
+                MaxLength = 0
+                MaxElementLength = 0
             }
         }
         
@@ -184,38 +186,53 @@ function Analyze-DocumentStructure {
         }
         
         # Handle different data types
+        # Note: dictionaries must be tested before IEnumerable, because every
+        # dictionary is also enumerable and would otherwise look like an array
         if ($null -eq $fieldValue) {
             # Null value - already counted in types
+        }
+        elseif (Test-IsDocumentObject -Value $fieldValue) { #if it is a sub-document  than mark it as nested and analyze its structure
+            # Nested object
+            $Schema[$fullPath].IsNested = $true
+            Analyze-DocumentStructure -Document $fieldValue -Schema $Schema -Path $fullPath -TotalDocs $TotalDocs
         }
         elseif ($fieldValue -is [System.Collections.IEnumerable] -and $fieldValue -isnot [string]) {
             # Array or collection
             $Schema[$fullPath].IsArray = $true
-            
+
             foreach ($item in $fieldValue) {
                 $itemType = Get-FieldType -Value $item
-                
+
                 if ($Schema[$fullPath].ArrayElementTypes.ContainsKey($itemType)) {
                     $Schema[$fullPath].ArrayElementTypes[$itemType]++
                 } else {
                     $Schema[$fullPath].ArrayElementTypes[$itemType] = 1
                 }
-                
+
+                # Track the longest element so the value column can be sized
+                if ($null -ne $item -and -not (Test-IsDocumentObject -Value $item)) {
+                    $itemLength = $item.ToString().Length
+                    if ($itemLength -gt $Schema[$fullPath].MaxElementLength) {
+                        $Schema[$fullPath].MaxElementLength = $itemLength
+                    }
+                }
+
                 # Recursively analyze nested objects in arrays
-                if ($item -is [PSCustomObject] -or $item -is [System.Collections.Hashtable]) {
+                if (Test-IsDocumentObject -Value $item) {
                     $Schema[$fullPath].IsNested = $true
                     Analyze-DocumentStructure -Document $item -Schema $Schema -Path "$fullPath[]" -TotalDocs $TotalDocs
                 }
             }
         }
-        elseif ($fieldValue -is [PSCustomObject] -or $fieldValue -is [System.Collections.Hashtable]) {
-            # Nested object
-            $Schema[$fullPath].IsNested = $true
-            Analyze-DocumentStructure -Document $fieldValue -Schema $Schema -Path $fullPath -TotalDocs $TotalDocs
-        }
         else {
+            # Track the real (untruncated) length so column sizes fit the data
+            $valueStr = $fieldValue.ToString()
+            if ($valueStr.Length -gt $Schema[$fullPath].MaxLength) {
+                $Schema[$fullPath].MaxLength = $valueStr.Length
+            }
+
             # Store sample values (limit to 3 unique samples)
             if ($Schema[$fullPath].SampleValues.Count -lt 3) {
-                $valueStr = $fieldValue.ToString()
                 if ($valueStr.Length -gt 50) {
                     $valueStr = $valueStr.Substring(0, 47) + "..."
                 }
@@ -227,16 +244,39 @@ function Analyze-DocumentStructure {
     }
 }
 
+function Test-IsDocumentObject {
+    <#
+    .SYNOPSIS
+    Tells whether a value is a sub-document (object) rather than an array or scalar
+
+    .DESCRIPTION
+    MongoDB sub-documents arrive as Mdbc.Dictionary / BsonDocument / hashtable,
+    all of which implement IDictionary. Because IDictionary is also IEnumerable,
+    this test must be used before any array test, otherwise sub-documents are
+    mistaken for arrays.
+    #>
+
+    param (
+        $Value
+    )
+
+    if ($null -eq $Value) {
+        return $false
+    }
+
+    return ($Value -is [System.Collections.IDictionary] -or $Value -is [PSCustomObject])
+}
+
 function Get-FieldType {
     <#
     .SYNOPSIS
     Determines the data type of a field value
     #>
-    
+
     param (
         $Value
     )
-    
+
     if ($null -eq $Value) {
         return "null"
     }
@@ -255,11 +295,11 @@ function Get-FieldType {
     elseif ($Value -is [datetime]) {
         return "datetime"
     }
-    elseif ($Value -is [System.Collections.IEnumerable] -and $Value -isnot [string]) {
-        return "array"
-    }
-    elseif ($Value -is [PSCustomObject] -or $Value -is [System.Collections.Hashtable]) {
+    elseif (Test-IsDocumentObject -Value $Value) {
         return "object"
+    }
+    elseif ($Value -is [System.Collections.IEnumerable]) {
+        return "array"
     }
     else {
         return $Value.GetType().Name
@@ -458,6 +498,56 @@ To ensure that all database connections are correctly configured and operational
     }
 
     
+    function Initialize-MySQLAssembly {
+        <#
+        .SYNOPSIS
+        Loads the MySQL Connector/NET assembly
+
+        .DESCRIPTION
+        Looks for MySql.Data.dll instead of hardcoding one connector version:
+        a copy next to the module first, then any installed connector version
+        (newest first), and finally the assembly name itself.
+        #>
+
+        if ('MySql.Data.MySqlClient.MySqlConnection' -as [type]) {
+            return $true
+        }
+
+        $candidates = @()
+        $candidates += Join-Path $PSScriptRoot "lib\MySql.Data.dll"
+
+        foreach ($programFiles in @($env:ProgramFiles, ${env:ProgramFiles(x86)})) {
+            if (-not $programFiles) { continue }
+
+            $mysqlRoot = Join-Path $programFiles "MySQL"
+            if (Test-Path $mysqlRoot) {
+                $candidates += Get-ChildItem -Path $mysqlRoot -Filter "MySql.Data.dll" -Recurse -ErrorAction SilentlyContinue |
+                               Sort-Object FullName -Descending |
+                               Select-Object -ExpandProperty FullName
+            }
+        }
+
+        foreach ($path in $candidates) {
+            if ($path -and (Test-Path $path)) {
+                try {
+                    Add-Type -Path $path -ErrorAction Stop
+                    return $true
+                }
+                catch {
+                    # Try the next candidate
+                }
+            }
+        }
+
+        try {
+            Add-Type -AssemblyName "MySql.Data" -ErrorAction Stop
+            return $true
+        }
+        catch {
+            return $false
+        }
+    }
+
     # MySQL Connection Test
     function Test-MySQLConnection {
         param (
@@ -485,10 +575,7 @@ To ensure that all database connections are correctly configured and operational
 
             $connectionString += "SslMode=Disabled;AllowPublicKeyRetrieval=True;"
 
-            try {
-                Add-Type -AssemblyName "MySql.Data" -ErrorAction Stop
-            }
-            catch {
+            if (-not (Initialize-MySQLAssembly)) {
                 throw "MySql.Data connector not found. Please install MySQL Connector/NET."
             }
 
@@ -629,7 +716,9 @@ To ensure that all database connections are correctly configured and operational
             }
             $connectionString += "SslMode=Disabled;AllowPublicKeyRetrieval=True;"
 
-            Add-Type -AssemblyName "MySql.Data" -ErrorAction SilentlyContinue
+            if (-not (Initialize-MySQLAssembly)) {
+                throw "MySql.Data connector not found. Please install MySQL Connector/NET."
+            }
 
             $conn = New-Object MySql.Data.MySqlClient.MySqlConnection
             $conn.ConnectionString = $connectionString
@@ -733,29 +822,45 @@ To ensure that all database connections are correctly configured and operational
         
         # Step 2: Create tables
         Write-Host "`nStep 2: Creating tables..." -ForegroundColor Yellow
+
+        # Column layout is read back from the database while inserting;
+        # start with an empty cache because the tables are recreated below
+        $script:N2STableColumns = @{}
+
+        # Child tables reference the main table, so drops must ignore the
+        # foreign keys while the tables are being recreated
+        if ($DatabaseType -eq "MySQL") {
+            Invoke-SQLNonQuery -Connection $sqlConnection -CommandText "SET FOREIGN_KEY_CHECKS = 0" | Out-Null
+        }
+
         foreach ($statement in $SQLSchema.Statements) {
-            try {
-                $cmd = $sqlConnection.CreateCommand()
-                
-                # Convert SQL Server syntax to MySQL if needed
-                if ($DatabaseType -eq "MySQL") {
-                    $statement = Convert-ToMySQLSyntax -SQLStatement $statement
+            # Convert SQL Server syntax to MySQL if needed
+            $targetStatement = $statement
+            if ($DatabaseType -eq "MySQL") {
+                $targetStatement = Convert-ToMySQLSyntax -SQLStatement $statement
+            }
+
+            # A statement block contains a DROP and a CREATE; send them separately
+            # so no batching support is needed from the database driver
+            foreach ($singleStatement in (Split-SQLStatement -SQLText $targetStatement)) {
+                try {
+                    Invoke-SQLNonQuery -Connection $sqlConnection -CommandText $singleStatement | Out-Null
+
+                    if ($singleStatement -match 'CREATE TABLE\s+[`\[]?(\w+)') {
+                        $tableName = $matches[1]
+                        $migrationResult.TablesCreated += $tableName
+                        $migrationResult.RecordsInserted[$tableName] = 0
+                        Write-Host " Created table: $tableName" -ForegroundColor Green
+                    }
                 }
-                
-                $cmd.CommandText = $statement
-                $cmd.ExecuteNonQuery() | Out-Null
-                
-                # Extract table name from statement
-                if ($statement -match "CREATE TABLE [`\[]?(\w+)[`\]]?") {
-                    $tableName = $matches[1]
-                    $migrationResult.TablesCreated += $tableName
-                    $migrationResult.RecordsInserted[$tableName] = 0
-                    Write-Host " Created table: $tableName" -ForegroundColor Green
+                catch {
+                    Write-Host "⚠ Table creation warning: $($_.Exception.Message)" -ForegroundColor Yellow
                 }
             }
-            catch {
-                Write-Host "⚠ Table creation warning: $($_.Exception.Message)" -ForegroundColor Yellow
-            }
+        }
+
+        if ($DatabaseType -eq "MySQL") {
+            Invoke-SQLNonQuery -Connection $sqlConnection -CommandText "SET FOREIGN_KEY_CHECKS = 1" | Out-Null
         }
         
         # Step 3: Migrate data
@@ -784,8 +889,9 @@ To ensure that all database connections are correctly configured and operational
                                                         -Connection $sqlConnection `
                                                         -TableName $SQLSchema.MainTable `
                                                         -Schema $Schema `
-                                                        -DatabaseType $DatabaseType
-                    
+                                                        -DatabaseType $DatabaseType `
+                                                        -SQLSchema $SQLSchema
+
                     if ($success) {
                         $migrationResult.MigratedDocuments++
                         $migrationResult.RecordsInserted[$SQLSchema.MainTable]++
@@ -809,11 +915,19 @@ To ensure that all database connections are correctly configured and operational
         }
         
         Write-Progress -Activity "Migrating documents" -Completed
-        
+
+        # Read back the real row counts so child tables are reported too
+        foreach ($table in $SQLSchema.Tables) {
+            $rowCount = Get-SQLTableRowCount -Connection $sqlConnection -TableName $table
+            if ($null -ne $rowCount) {
+                $migrationResult.RecordsInserted[$table] = $rowCount
+            }
+        }
+
         # Step 4: Summary
         $migrationResult.EndTime = Get-Date
         $duration = $migrationResult.EndTime - $migrationResult.StartTime
-        
+
         Write-Host "`n═══════════════════════════════════════════════════════" -ForegroundColor Cyan
         Write-Host "Migration Complete!" -ForegroundColor Green
         Write-Host "═══════════════════════════════════════════════════════" -ForegroundColor Cyan
@@ -850,73 +964,359 @@ To ensure that all database connections are correctly configured and operational
     }
 }
 
+function Invoke-SQLNonQuery {
+    <#
+    .SYNOPSIS
+    Executes a single SQL statement without result set
+    #>
+
+    param (
+        $Connection,
+        [string]$CommandText
+    )
+
+    $cmd = $Connection.CreateCommand()
+    $cmd.CommandText = $CommandText
+    return $cmd.ExecuteNonQuery()
+}
+
+function Split-SQLStatement {
+    <#
+    .SYNOPSIS
+    Splits a generated SQL block into separate statements
+
+    .DESCRIPTION
+    The schema generator emits a DROP and a CREATE in one block. Sending them as
+    one command would rely on multi statement support in the database driver, so
+    they are split here. Fragments that only contain comments are dropped.
+    #>
+
+    param (
+        [string]$SQLText
+    )
+
+    $statements = @()
+
+    foreach ($part in ($SQLText -split ';')) {
+        $codeLines = $part -split "`n" | Where-Object {
+            $_.Trim() -ne '' -and -not $_.Trim().StartsWith('--')
+        }
+
+        if ($codeLines.Count -gt 0) {
+            $statements += $part.Trim()
+        }
+    }
+
+    return $statements
+}
+
+function Get-SQLTableRowCount {
+    <#
+    .SYNOPSIS
+    Returns the number of rows in a table, or $null when it cannot be read
+    #>
+
+    param (
+        $Connection,
+        [string]$TableName
+    )
+
+    try {
+        $cmd = $Connection.CreateCommand()
+        $cmd.CommandText = 'SELECT COUNT(*) FROM `' + $TableName + '`'
+        return [int]$cmd.ExecuteScalar()
+    }
+    catch {
+        return $null
+    }
+}
+
+function Get-SQLTableColumns {
+    <#
+    .SYNOPSIS
+    Returns the columns of a table as a lookup hashtable (cached per run)
+
+    .DESCRIPTION
+    The SQL schema is built from a sample of the collection, so a document can
+    contain a field that has no column. Checking the real table layout keeps
+    those documents from failing on an unknown column.
+    #>
+
+    param (
+        $Connection,
+        [string]$TableName
+    )
+
+    if ($null -eq $script:N2STableColumns) {
+        $script:N2STableColumns = @{}
+    }
+
+    if ($script:N2STableColumns.ContainsKey($TableName)) {
+        return $script:N2STableColumns[$TableName]
+    }
+
+    $columns = @{}
+
+    try {
+        $cmd = $Connection.CreateCommand()
+        $cmd.CommandText = 'SHOW COLUMNS FROM `' + $TableName + '`'
+        $reader = $cmd.ExecuteReader()
+
+        while ($reader.Read()) {
+            $columns[$reader.GetString(0)] = $true
+        }
+        $reader.Close()
+
+        $script:N2STableColumns[$TableName] = $columns
+    }
+    catch {
+        Write-Host "Warning: could not read columns of table $TableName : $($_.Exception.Message)" -ForegroundColor Yellow
+    }
+
+    return $columns
+}
+
+function ConvertTo-FlatRow {
+    <#
+    .SYNOPSIS
+    Flattens a sub-document into column name / value pairs
+
+    .DESCRIPTION
+    Deeper sub-documents are flattened with a dotted column name, which matches
+    the column names generated for nested objects. Arrays inside a sub-document
+    are skipped: they have no table of their own.
+    #>
+
+    param (
+        $Object,
+        [string]$Prefix = ""
+    )
+
+    $row = [ordered]@{}
+
+    if ($null -eq $Object) {
+        return $row
+    }
+
+    $entries = @()
+
+    if ($Object -is [System.Collections.IDictionary]) {
+        foreach ($key in $Object.Keys) {
+            $entries += [PSCustomObject]@{ Name = $key; Value = $Object[$key] }
+        }
+    }
+    elseif ($Object -is [PSCustomObject]) {
+        foreach ($property in $Object.PSObject.Properties) {
+            $entries += [PSCustomObject]@{ Name = $property.Name; Value = $property.Value }
+        }
+    }
+
+    foreach ($entry in $entries) {
+        $columnName = "$Prefix$($entry.Name)"
+        $value = $entry.Value
+
+        if (Test-IsDocumentObject -Value $value) {
+            $nestedRow = ConvertTo-FlatRow -Object $value -Prefix "$columnName."
+            foreach ($nested in $nestedRow.GetEnumerator()) {
+                $row[$nested.Key] = $nested.Value
+            }
+        }
+        elseif ($null -ne $value -and $value -is [System.Collections.IEnumerable] -and $value -isnot [string]) {
+            continue
+        }
+        else {
+            $row[$columnName] = $value
+        }
+    }
+
+    return $row
+}
+
+function Add-SQLRow {
+    <#
+    .SYNOPSIS
+    Inserts one row, built from an ordered column / value map
+    #>
+
+    param (
+        $Connection,
+        [string]$TableName,
+        $Row,
+        [switch]$Replace
+    )
+
+    $columns = @($Row.Keys)
+    $columnList = ($columns | ForEach-Object { '`' + $_ + '`' }) -join ', '
+    $placeholders = ($columns | ForEach-Object { '?' }) -join ', '
+    $verb = if ($Replace) { 'REPLACE INTO' } else { 'INSERT INTO' }
+
+    $cmd = $Connection.CreateCommand()
+    $cmd.CommandText = "$verb " + '`' + $TableName + '` (' + $columnList + ') VALUES (' + $placeholders + ')'
+
+    foreach ($column in $columns) {
+        $param = $cmd.CreateParameter()
+        $param.Value = $Row[$column]
+        $cmd.Parameters.Add($param) | Out-Null
+    }
+
+    $cmd.ExecuteNonQuery() | Out-Null
+}
+
+function Invoke-ChildTableMigration {
+    <#
+    .SYNOPSIS
+    Writes the array or sub-document of one parent document to its child table
+    #>
+
+    param (
+        $Connection,
+        [string]$ChildTable,
+        [string]$ParentKeyColumn,
+        $ParentId,
+        $Value,
+        [string]$DatabaseType
+    )
+
+    $childColumns = Get-SQLTableColumns -Connection $Connection -TableName $ChildTable
+    if ($childColumns.Count -eq 0) {
+        return 0
+    }
+
+    # Remove rows of a previous run for this parent, so re-running stays idempotent
+    $delete = $Connection.CreateCommand()
+    $delete.CommandText = 'DELETE FROM `' + $ChildTable + '` WHERE `' + $ParentKeyColumn + '` = ?'
+    $deleteParam = $delete.CreateParameter()
+    $deleteParam.Value = $ParentId
+    $delete.Parameters.Add($deleteParam) | Out-Null
+    $delete.ExecuteNonQuery() | Out-Null
+
+    $rowsWritten = 0
+
+    if (Test-IsDocumentObject -Value $Value) {
+        # Sub-document: exactly one child row
+        $row = [ordered]@{}
+        $row[$ParentKeyColumn] = $ParentId
+
+        foreach ($entry in (ConvertTo-FlatRow -Object $Value).GetEnumerator()) {
+            if ($childColumns.ContainsKey($entry.Key)) {
+                $row[$entry.Key] = Convert-ToSQLValue -Value $entry.Value -DatabaseType $DatabaseType
+            }
+        }
+
+        Add-SQLRow -Connection $Connection -TableName $ChildTable -Row $row
+        $rowsWritten++
+    }
+    else {
+        # Array: one child row per element, position kept in array_index
+        $index = 0
+
+        foreach ($item in $Value) {
+            $row = [ordered]@{}
+            $row[$ParentKeyColumn] = $ParentId
+
+            if ($childColumns.ContainsKey('array_index')) {
+                $row['array_index'] = $index
+            }
+
+            if (Test-IsDocumentObject -Value $item) {
+                foreach ($entry in (ConvertTo-FlatRow -Object $item).GetEnumerator()) {
+                    if ($childColumns.ContainsKey($entry.Key)) {
+                        $row[$entry.Key] = Convert-ToSQLValue -Value $entry.Value -DatabaseType $DatabaseType
+                    }
+                }
+            }
+            elseif ($childColumns.ContainsKey('value')) {
+                $row['value'] = Convert-ToSQLValue -Value $item -DatabaseType $DatabaseType
+            }
+
+            Add-SQLRow -Connection $Connection -TableName $ChildTable -Row $row
+            $rowsWritten++
+            $index++
+        }
+    }
+
+    return $rowsWritten
+}
+
 function Invoke-DocumentMigration {
     <#
     .SYNOPSIS
     Migrates a single MongoDB document to SQL
+
+    .DESCRIPTION
+    Scalar fields become a row in the main table. Arrays and sub-documents are
+    written to their own child table, linked by the parent _id.
     #>
-    
+
     param (
         $Document,
         $Connection,
         [string]$TableName,
         [hashtable]$Schema,
-        [string]$DatabaseType
+        [string]$DatabaseType,
+        $SQLSchema = $null,
+        [string]$PrimaryKeyField = "_id"
     )
-    
+
     try {
-        # Extract flat fields only (no nested or arrays)
+        # Split the document: scalars for the main table, arrays and
+        # sub-documents for the child tables
         $flatFields = @{}
-        
+        $childFields = @{}
+
         if ($Document -is [System.Collections.IDictionary]) {
             foreach ($key in $Document.Keys) {
                 $value = $Document[$key]
-                
-                # Skip nested objects and arrays for main table
-                if ($value -isnot [System.Collections.IEnumerable] -or $value -is [string]) {
-                    if ($value -isnot [PSCustomObject] -and $value -isnot [System.Collections.Hashtable]) {
-                        $flatFields[$key] = $value
-                    }
+
+                if ((Test-IsDocumentObject -Value $value) -or
+                    ($null -ne $value -and $value -is [System.Collections.IEnumerable] -and $value -isnot [string])) {
+                    $childFields[$key] = $value
+                }
+                else {
+                    $flatFields[$key] = $value
                 }
             }
         }
-        
-        # Build INSERT statement
-        $columns = @()
-        $values  = @()
-        
+
+        # Write only fields that have a column in the table
+        $tableColumns = Get-SQLTableColumns -Connection $Connection -TableName $TableName
+
+        $row = [ordered]@{}
         foreach ($field in $flatFields.Keys) {
-        # use two backticks to get one backtick in the text
-        # And no backtick before the $field, because that variable should be read
-        $columns += "``$field``" 
-        
-        $values += "?"
+            if ($tableColumns.Count -eq 0 -or $tableColumns.ContainsKey($field)) {
+                $row[$field] = Convert-ToSQLValue -Value $flatFields[$field] -DatabaseType $DatabaseType
+            }
         }
-        
-        # Build INSERT SQL with backticked table name
-        # Use REPLACE INTO instead of INSERT INTO to handle duplicates
-        $insertSQL = "REPLACE INTO " + ('`' + $TableName + '`') + " (" + ($columns -join ', ') + ") VALUES (" + ($values -join ', ') + ")"
-        
-        # Create command
-        $cmd = $Connection.CreateCommand()
-        $cmd.CommandText = $insertSQL
-        
-        # Add parameters for MySQL
-        foreach ($field in $flatFields.Keys) {
-            $value = $flatFields[$field]
-            
-            # Convert value to appropriate SQL type
-            $sqlValue = Convert-ToSQLValue -Value $value -DatabaseType $DatabaseType
-            
-            # For MySQL, use CreateParameter
-            $param = $cmd.CreateParameter()
-            $param.Value = $sqlValue
-            $cmd.Parameters.Add($param) | Out-Null
+
+        if ($row.Count -eq 0) {
+            Write-Host "Error migrating document: no matching columns in table $TableName" -ForegroundColor Red
+            return $false
         }
-        
-        # Execute
-        $cmd.ExecuteNonQuery() | Out-Null
-        
+
+        # REPLACE INTO instead of INSERT INTO to handle duplicates
+        Add-SQLRow -Connection $Connection -TableName $TableName -Row $row -Replace
+
+        # Child tables for arrays and sub-documents
+        if ($null -ne $SQLSchema -and $childFields.Count -gt 0) {
+            $parentId = Convert-ToSQLValue -Value $Document[$PrimaryKeyField] -DatabaseType $DatabaseType
+            $parentKeyColumn = "${TableName}_${PrimaryKeyField}"
+
+            foreach ($field in $childFields.Keys) {
+                $childTable = "${TableName}_${field}"
+
+                if ($SQLSchema.Tables -notcontains $childTable) {
+                    continue
+                }
+
+                Invoke-ChildTableMigration -Connection $Connection `
+                                           -ChildTable $childTable `
+                                           -ParentKeyColumn $parentKeyColumn `
+                                           -ParentId $parentId `
+                                           -Value $childFields[$field] `
+                                           -DatabaseType $DatabaseType | Out-Null
+            }
+        }
+
         return $true
     }
     catch {
@@ -983,30 +1383,26 @@ function Convert-ToMySQLSyntax {
     
     # Remove SQL Server specific syntax
     $mysqlStatement = $SQLStatement
-    
-    # Remove IF OBJECT_ID checks
-    $mysqlStatement = $mysqlStatement -replace "IF OBJECT_ID\('[^']+',\s*'U'\)\s*IS NOT NULL\s*", ""
-    $mysqlStatement = $mysqlStatement -replace "DROP TABLE [^;]+;", ""
-    
+
+    # Turn the T-SQL existence check into MySQL's DROP TABLE IF EXISTS
+    $mysqlStatement = $mysqlStatement -replace "IF OBJECT_ID\('[^']+',\s*'U'\)\s*IS NOT NULL\s*DROP TABLE\s*", "DROP TABLE IF EXISTS "
+
     # Replace square brackets with backticks
     $mysqlStatement = $mysqlStatement -replace '\[', '`'
     $mysqlStatement = $mysqlStatement -replace '\]', '`'
-    
+
     # Replace IDENTITY with AUTO_INCREMENT
     $mysqlStatement = $mysqlStatement -replace 'INT IDENTITY\(1,1\)', 'INT AUTO_INCREMENT'
-    
+
+    # MySQL has no VARCHAR(MAX): unbounded text becomes LONGTEXT
+    $mysqlStatement = $mysqlStatement -replace '\bN?VARCHAR\s*\(\s*MAX\s*\)', 'LONGTEXT'
+
     # Replace BIT with TINYINT(1) for booleans
     $mysqlStatement = $mysqlStatement -replace '\sBIT\b', ' TINYINT(1)'
-    
+
     # Replace DATETIME2 with DATETIME
     $mysqlStatement = $mysqlStatement -replace 'DATETIME2', 'DATETIME'
-    
-    # Add DROP TABLE IF EXISTS for MySQL
-    if ($mysqlStatement -match "CREATE TABLE ``(\w+)``") {
-        $tableName = $matches[1]
-        $mysqlStatement = "DROP TABLE IF EXISTS `$tableName`;`n`n$mysqlStatement"
-    }
-    
+
     return $mysqlStatement
 }
 
@@ -1037,20 +1433,11 @@ function Get-SQLConnectionObject {
         }
         $connectionString += "SslMode=Disabled;AllowPublicKeyRetrieval=True;"
         
-        # Load MySQL DLL
-        $dllPaths = @(
-            "/mnt/c/Program Files (x86)/MySQL/MySQL Connector NET 9.5/MySql.Data.dll",
-            "/mnt/c/Program Files/MySQL/MySQL Connector NET 9.5/MySql.Data.dll",
-            "C:\Program Files (x86)\MySQL\MySQL Connector NET 9.5\MySql.Data.dll"
-        )
-        
-        foreach ($path in $dllPaths) {
-            if (Test-Path $path) {
-                Add-Type -Path $path -ErrorAction SilentlyContinue
-                break
-            }
+        # Load MySQL DLL (any installed connector version)
+        if (-not (Initialize-MySQLAssembly)) {
+            throw "MySql.Data connector not found. Please install MySQL Connector/NET."
         }
-        
+
         $connection = New-Object MySql.Data.MySqlClient.MySqlConnection
         $connection.ConnectionString = $connectionString
         
@@ -1191,35 +1578,29 @@ function New-SQLSchema {
     
     foreach ($fieldPath in $Schema.Keys) {
         $fieldInfo = $Schema[$fieldPath]
-        
-        # Skip fields that are inside arrays (they have [] in path)
-        if ($fieldPath -match '\[\]\.') {
+
+        # Skip fields that are inside arrays (they have [] in path);
+        # they are handled together with their array below
+        if ($fieldPath -match '\[\]') {
             continue
         }
-        
-        # Check if this is an array element container
-        if ($fieldPath -match '\[\]$') {
-            $cleanPath = $fieldPath -replace '\[\]$', ''
-            $arrayFields[$cleanPath] = $fieldInfo
+
+        # Skip fields of a nested object (dotted path);
+        # they are handled together with their parent object below
+        if ($fieldPath -like '*.*') {
+            continue
         }
-        # Check if this is a nested object field
-        elseif ($fieldPath -contains '.') {
-            $rootPath = $fieldPath.Split('.')[0]
-            if (-not $nestedObjects.ContainsKey($rootPath)) {
-                $nestedObjects[$rootPath] = @{}
-            }
-            $nestedObjects[$rootPath][$fieldPath] = $fieldInfo
+
+        # Top level field: an array becomes a child table, a sub-document
+        # becomes its own table, everything else is a column of the main table
+        if ($fieldInfo.IsArray) {
+            $arrayFields[$fieldPath] = $fieldInfo
         }
-        # Regular flat field
+        elseif ($fieldInfo.IsNested) {
+            $nestedObjects[$fieldPath] = $fieldInfo
+        }
         else {
-            # Only add if not array or nested
-            if (-not $fieldInfo.IsArray -and -not $fieldInfo.IsNested) {
-                $flatFields[$fieldPath] = $fieldInfo
-            }
-            elseif ($fieldInfo.IsNested -and -not $fieldInfo.IsArray) {
-                # Nested object (not array)
-                $nestedObjects[$fieldPath] = @{$fieldPath = $fieldInfo}
-            }
+            $flatFields[$fieldPath] = $fieldInfo
         }
     }
     
@@ -1282,10 +1663,12 @@ function New-SQLSchema {
         
         if ($hasObjects) {
             # Array of objects - get nested fields
+            # (-like is not usable here: [] is a wildcard character class)
             $arrayObjectFields = @{}
+            $arrayPrefix = "$arrayPath[]."
             foreach ($fieldPath in $Schema.Keys) {
-                if ($fieldPath -like "${arrayPath}[].*") {
-                    $shortName = $fieldPath -replace "^${arrayPath}\[\]\.", ""
+                if ($fieldPath.StartsWith($arrayPrefix)) {
+                    $shortName = $fieldPath.Substring($arrayPrefix.Length)
                     $arrayObjectFields[$shortName] = $Schema[$fieldPath]
                 }
             }
@@ -1344,30 +1727,27 @@ function New-TableDefinition {
     
     if ($IncludeDrop) {
         $sql += "-- Drop table if exists`n"
-        $sql += "IF OBJECT_ID('$TableName', 'U') IS NOT NULL DROP TABLE $TableName;`n`n"
+        $sql += "IF OBJECT_ID('$TableName', 'U') IS NOT NULL DROP TABLE [$TableName];`n`n"
     }
-    
+
     $sql += "-- Main table: $TableName`n"
-    $sql += "CREATE TABLE $TableName (`n"
-    
+    $sql += "CREATE TABLE [$TableName] (`n"
+
     $columns = @()
-    
+
     foreach ($fieldName in ($Fields.Keys | Sort-Object)) {
         $fieldInfo = $Fields[$fieldName]
         $sqlType = Convert-MongoTypeToSQL -FieldInfo $fieldInfo -FieldName $fieldName
-        
+
         $columnDef = "    [$fieldName] $sqlType"
-        
-        # Add PRIMARY KEY constraint
+
+        # Only the primary key is NOT NULL. The schema is derived from a sample,
+        # so a field seen in every sampled document can still be missing from
+        # documents outside the sample - MongoDB has no schema guarantee.
         if ($fieldName -eq $PrimaryKeyField) {
-            $columnDef += " PRIMARY KEY"
+            $columnDef += " PRIMARY KEY NOT NULL"
         }
-        
-        # Add NOT NULL for fields that appear in all documents
-        if ($fieldInfo.Count -eq $Schema[$fieldName].Count) {
-            $columnDef += " NOT NULL"
-        }
-        
+
         $columns += $columnDef
     }
     
@@ -1395,11 +1775,11 @@ function New-NestedTableDefinition {
     
     if ($IncludeDrop) {
         $sql += "`n-- Drop table if exists`n"
-        $sql += "IF OBJECT_ID('$TableName', 'U') IS NOT NULL DROP TABLE $TableName;`n`n"
+        $sql += "IF OBJECT_ID('$TableName', 'U') IS NOT NULL DROP TABLE [$TableName];`n`n"
     }
     
     $sql += "-- Nested object table: $TableName`n"
-    $sql += "CREATE TABLE $TableName (`n"
+    $sql += "CREATE TABLE [$TableName] (`n"
     
     $columns = @()
     
@@ -1418,7 +1798,7 @@ function New-NestedTableDefinition {
     
     $sql += ($columns -join ",`n")
     $sql += ",`n"
-    $sql += "    FOREIGN KEY ([${ParentTable}_${ParentKeyField}]) REFERENCES $ParentTable([$ParentKeyField])`n"
+    $sql += "    FOREIGN KEY ([${ParentTable}_${ParentKeyField}]) REFERENCES [$ParentTable]([$ParentKeyField])`n"
     $sql += ");`n"
     
     return $sql
@@ -1442,11 +1822,11 @@ function New-ArrayObjectTableDefinition {
     
     if ($IncludeDrop) {
         $sql += "`n-- Drop table if exists`n"
-        $sql += "IF OBJECT_ID('$TableName', 'U') IS NOT NULL DROP TABLE $TableName;`n`n"
+        $sql += "IF OBJECT_ID('$TableName', 'U') IS NOT NULL DROP TABLE [$TableName];`n`n"
     }
     
     $sql += "-- Array of objects table: $TableName`n"
-    $sql += "CREATE TABLE $TableName (`n"
+    $sql += "CREATE TABLE [$TableName] (`n"
     
     $columns = @()
     
@@ -1468,7 +1848,7 @@ function New-ArrayObjectTableDefinition {
     
     $sql += ($columns -join ",`n")
     $sql += ",`n"
-    $sql += "    FOREIGN KEY ([${ParentTable}_${ParentKeyField}]) REFERENCES $ParentTable([$ParentKeyField])`n"
+    $sql += "    FOREIGN KEY ([${ParentTable}_${ParentKeyField}]) REFERENCES [$ParentTable]([$ParentKeyField])`n"
     $sql += ");`n"
     
     return $sql
@@ -1492,11 +1872,11 @@ function New-ArrayPrimitiveTableDefinition {
     
     if ($IncludeDrop) {
         $sql += "`n-- Drop table if exists`n"
-        $sql += "IF OBJECT_ID('$TableName', 'U') IS NOT NULL DROP TABLE $TableName;`n`n"
+        $sql += "IF OBJECT_ID('$TableName', 'U') IS NOT NULL DROP TABLE [$TableName];`n`n"
     }
     
     $sql += "-- Array of primitives table: $TableName`n"
-    $sql += "CREATE TABLE $TableName (`n"
+    $sql += "CREATE TABLE [$TableName] (`n"
     
     $columns = @()
     
@@ -1509,23 +1889,38 @@ function New-ArrayPrimitiveTableDefinition {
     # Add array index
     $columns += "    [array_index] INT NOT NULL"
     
-    # Determine value type from array element types
+    # Determine value type from array element types.
+    # Mixed element types fall back to text, so no value can be rejected.
+    $elementTypes = @($ArrayInfo.ArrayElementTypes.Keys | Where-Object { $_ -ne 'null' })
     $valueType = "VARCHAR(MAX)"
-    if ($ArrayInfo.ArrayElementTypes.ContainsKey('integer')) {
-        $valueType = "INT"
+
+    if ($elementTypes.Count -eq 1) {
+        switch ($elementTypes[0]) {
+            'integer'  { $valueType = "INT" }
+            'number'   { $valueType = "DECIMAL(18,2)" }
+            'boolean'  { $valueType = "BIT" }
+            'datetime' { $valueType = "DATETIME2" }
+            'ObjectId' { $valueType = "VARCHAR(24)" }
+            'string'   {
+                if ($ArrayInfo.MaxElementLength -gt 255) {
+                    $valueType = "VARCHAR(MAX)"
+                } else {
+                    $valueType = "VARCHAR(255)"
+                }
+            }
+        }
     }
-    elseif ($ArrayInfo.ArrayElementTypes.ContainsKey('number')) {
+    elseif ($elementTypes.Count -gt 1 -and @($elementTypes | Where-Object { $_ -notin @('integer', 'number') }).Count -eq 0) {
+        # Only numeric elements, but mixed integer/number
         $valueType = "DECIMAL(18,2)"
     }
-    elseif ($ArrayInfo.ArrayElementTypes.ContainsKey('boolean')) {
-        $valueType = "BIT"
-    }
-    
+
+
     $columns += "    [value] $valueType"
     
     $sql += ($columns -join ",`n")
     $sql += ",`n"
-    $sql += "    FOREIGN KEY ([${ParentTable}_${ParentKeyField}]) REFERENCES $ParentTable([$ParentKeyField])`n"
+    $sql += "    FOREIGN KEY ([${ParentTable}_${ParentKeyField}]) REFERENCES [$ParentTable]([$ParentKeyField])`n"
     $sql += ");`n"
     
     return $sql
@@ -1553,13 +1948,13 @@ function Convert-MongoTypeToSQL {
     # Map MongoDB types to SQL types
     switch ($primaryType) {
         "string" {
-            # Check sample values to estimate length
+            # Size the column on the longest value seen during analysis.
+            # SampleValues cannot be used for this: they are truncated to 50
+            # characters for display, which made every string fit VARCHAR(255)
+            # and long text (for example a storyline) fail on insert.
             $maxLength = 255
-            if ($FieldInfo.SampleValues.Count -gt 0) {
-                $maxSampleLength = ($FieldInfo.SampleValues | Measure-Object -Property Length -Maximum).Maximum
-                if ($maxSampleLength -gt 255) {
-                    $maxLength = "MAX"
-                }
+            if ($FieldInfo.MaxLength -gt 255) {
+                $maxLength = "MAX"
             }
             return "VARCHAR($maxLength)"
         }
@@ -2078,9 +2473,11 @@ function Normalize-ValueForComparison {
         }
     }
     
-    # Handle numbers (convert to string for comparison)
+    # Handle numbers: compare on numeric value, not on formatting.
+    # MySQL returns DECIMAL(18,2) as 8.30 where MongoDB has the double 8.3,
+    # and the local culture writes the separator as a comma.
     if ($Value -is [int] -or $Value -is [long] -or $Value -is [double] -or $Value -is [decimal]) {
-        return $Value.ToString()
+        return ([double]$Value).ToString([System.Globalization.CultureInfo]::InvariantCulture)
     }
     
     # Handle DateTime
@@ -2839,7 +3236,13 @@ function Get-SQLDataType {
     $valueType = $Value.GetType().Name
     
     switch -Wildcard ($valueType) {
-        "String" { return "VARCHAR(255)" }
+        "String" {
+            # A value longer than 255 characters does not fit VARCHAR(255)
+            if ($Value.Length -gt 255) {
+                return "LONGTEXT"
+            }
+            return "VARCHAR(255)"
+        }
         "Int*" { return "INT" }
         "Double" { return "DECIMAL(18,2)" }
         "Float" { return "DECIMAL(18,2)" }
@@ -3218,7 +3621,7 @@ function Invoke-MigrationWorkflow {
     # Get collections to process
     if ($Collections.Count -eq 0) {
         Write-Host "Discovering collections..." -ForegroundColor Yellow
-        $discoveredCollections = Get-MongoDBCollections
+        $discoveredCollections = @(Get-MongoDBCollections)
         
         if ($discoveredCollections.Count -eq 0) {
             Write-Host "No collections found in database." -ForegroundColor Red
@@ -3728,7 +4131,7 @@ function Menu-DiscoverCollections {
     
     Write-Host "`nScanning database..." -ForegroundColor Yellow
     
-    $collections = Get-MongoDBCollections
+    $collections = @(Get-MongoDBCollections)
     
     if ($collections.Count -eq 0) {
         Write-Host "`n No collections found!" -ForegroundColor Red
@@ -3738,20 +4141,20 @@ function Menu-DiscoverCollections {
     Write-Host "`n Found $($collections.Count) collection(s):" -ForegroundColor Green
     Write-Host ""
     
-    foreach ($collection in $collections) {
+    foreach ($collectionName in $collections) {
         # Get document count
         try {
             Connect-Mdbc -ConnectionString $AppConfig.MongoDB.ConnectionString `
                          -DatabaseName $AppConfig.MongoDB.Database `
-                         -CollectionName $collection
+                         -CollectionName $collectionName
             
             $count = Get-MdbcData -Count
             Write-Host "  • " -NoNewline -ForegroundColor Cyan
-            Write-Host "$collection " -NoNewline -ForegroundColor White
+            Write-Host "$collectionName " -NoNewline -ForegroundColor White
             Write-Host "($count documents)" -ForegroundColor Gray
         }
         catch {
-            Write-Host "  • $collection (error reading count)" -ForegroundColor Yellow
+            Write-Host "  • $collectionName (error reading count)" -ForegroundColor Yellow
         }
     }
 }
@@ -3761,7 +4164,7 @@ function Menu-MigrateSingle {
     Write-Host "Migrate Single Collection" -ForegroundColor Cyan
     Write-Host ("="*60) -ForegroundColor Cyan
     
-    $collections = Get-MongoDBCollections
+    $collections = @(Get-MongoDBCollections)
     
     if ($collections.Count -eq 0) {
         Write-Host "`n No collections found!" -ForegroundColor Red
@@ -3801,7 +4204,7 @@ function Menu-MigrateMultiple {
     Write-Host "Migrate Multiple Collections" -ForegroundColor Cyan
     Write-Host ("="*60) -ForegroundColor Cyan
     
-    $collections = Get-MongoDBCollections
+    $collections = @(Get-MongoDBCollections)
     
     if ($collections.Count -eq 0) {
         Write-Host "`n No collections found!" -ForegroundColor Red
@@ -3850,7 +4253,7 @@ function Menu-MigrateAll {
     Write-Host "Migrate ALL Collections" -ForegroundColor Cyan
     Write-Host ("="*60) -ForegroundColor Cyan
     
-    $collections = Get-MongoDBCollections
+    $collections = @(Get-MongoDBCollections)
     
     if ($collections.Count -eq 0) {
         Write-Host "`n No collections found!" -ForegroundColor Red
@@ -3878,7 +4281,7 @@ function Menu-SyncSingle {
     Write-Host "Sync Single Collection (Incremental)" -ForegroundColor Cyan
     Write-Host ("="*60) -ForegroundColor Cyan
     
-    $collections = Get-MongoDBCollections
+    $collections = @(Get-MongoDBCollections)
     
     if ($collections.Count -eq 0) {
         Write-Host "`n No collections found!" -ForegroundColor Red
@@ -3912,7 +4315,7 @@ function Menu-SyncAll {
     Write-Host "Sync ALL Collections" -ForegroundColor Cyan
     Write-Host ("="*60) -ForegroundColor Cyan
     
-    $collections = Get-MongoDBCollections
+    $collections = @(Get-MongoDBCollections)
     
     if ($collections.Count -eq 0) {
         Write-Host "`n No collections found!" -ForegroundColor Red
@@ -3940,7 +4343,7 @@ function Menu-ValidateSingle {
     Write-Host "Validate Single Collection" -ForegroundColor Cyan
     Write-Host ("="*60) -ForegroundColor Cyan
     
-    $collections = Get-MongoDBCollections
+    $collections = @(Get-MongoDBCollections)
     
     if ($collections.Count -eq 0) {
         Write-Host "`n No collections found!" -ForegroundColor Red
@@ -3978,7 +4381,7 @@ function Menu-SchemaOnly {
     Write-Host "Analyze Schema Only" -ForegroundColor Cyan
     Write-Host ("="*60) -ForegroundColor Cyan
     
-    $collections = Get-MongoDBCollections
+    $collections = @(Get-MongoDBCollections)
     
     if ($collections.Count -eq 0) {
         Write-Host "`n No collections found!" -ForegroundColor Red
