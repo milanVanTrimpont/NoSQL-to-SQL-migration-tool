@@ -1500,7 +1500,7 @@ function Export-MigrationLog {
         if ($MigrationResult.Errors.Count -gt 0) {
             $log += "`nErrors:`n"
             foreach ($err in $MigrationResult.Errors) {
-                $log += "  [$($error.Timestamp)] Document $($error.Document): $($error.Error)`n"
+                $log += "  [$($err.Timestamp)] Document $($err.Document): $($err.Error)`n"
             }
         }
         
@@ -2791,11 +2791,17 @@ function Start-IncrementalSync {
         DeletedRecords = 0
         UnchangedRecords = 0
         TotalProcessed = 0
+        RepairedChildRecords = 0
+        ChildRecords = @{}
         Errors = @()
+        Warnings = @()
         LastSyncTime = $null
         IsFullSync = $ForceFullSync.IsPresent
     }
-    
+
+    # Table layout is read back from the database while writing rows
+    $script:N2STableColumns = @{}
+
     try {
         # Step 1: Load or create sync state
         $syncStateFile = ".\sync_state_$TableName.json"
@@ -2842,7 +2848,49 @@ function Start-IncrementalSync {
         else {
             Write-Host " Schema is up to date" -ForegroundColor Gray
         }
+ 
         
+        : Find the child tables holding arrays and sub-documents
+        $childTables = Get-ChildTableMap -Connection $sqlConnection `
+                                         -TableName $TableName `
+                                         -PrimaryKeyField "_id"
+
+        $parentKeyColumn = "${TableName}__id"
+        $childRowCounts = @{}
+
+        if ($childTables.Count -gt 0) {
+            Write-Host " Child tables: $(($childTables.Values | Sort-Object) -join ', ')" -ForegroundColor Gray
+
+            #  
+            foreach ($fieldName in $childTables.Keys) {
+                $childRowCounts[$fieldName] = Get-ChildRowCounts -Connection $sqlConnection `
+                                                                 -ChildTable $childTables[$fieldName] `
+                                                                 -ParentKeyColumn $parentKeyColumn
+            }
+        }
+
+        # Warn about array or sub-document fields that have no child table yet.
+        # Creating tables is the job of a Full Migration, not of a sync.
+        $missingChildFields = @{}
+
+        foreach ($doc in $mongoDocuments) {
+            foreach ($key in $doc.Keys) {
+                $value = $doc[$key]
+
+                if ((Test-IsDocumentObject -Value $value) -or
+                    ($null -ne $value -and $value -is [System.Collections.IEnumerable] -and $value -isnot [string])) {
+                    if (-not $childTables.ContainsKey($key)) {
+                        $missingChildFields[$key] = $true
+                    }
+                }
+            }
+        }
+
+        foreach ($fieldName in ($missingChildFields.Keys | Sort-Object)) {
+            Write-Host " Field '$fieldName' has no child table - run a Full Migration to create it" -ForegroundColor Yellow
+            $syncResult.Warnings += "Field '$fieldName' has no child table; run a Full Migration for $TableName"
+        }
+
         # Step 3: Get current SQL records
         Write-Host "`nStep 2: Loading existing SQL records..." -ForegroundColor Yellow
         $existingRecords = Get-AllSQLRecords -Connection $sqlConnection `
@@ -2875,7 +2923,21 @@ function Start-IncrementalSync {
                     $null
                 }
                 
-                if ($syncResult.IsFullSync -or $docHash -ne $lastHash) {
+                # The hash only describes MongoDB, so child rows that were changed
+                # straight in SQL are picked up by the row count check
+                $childDrift = $false
+                if (-not $syncResult.IsFullSync -and $docHash -eq $lastHash) {
+                    $childDrift = Test-ChildRowDrift -Document $doc `
+                                                     -DocumentId $docId `
+                                                     -ChildTables $childTables `
+                                                     -ChildRowCounts $childRowCounts
+
+                    if ($childDrift) {
+                        $syncResult.RepairedChildRecords++
+                    }
+                }
+
+                if ($syncResult.IsFullSync -or $docHash -ne $lastHash -or $childDrift) {
                     $updatedDocs += @{
                         Document = $doc
                         Id = $docId
@@ -2927,8 +2989,14 @@ function Start-IncrementalSync {
                                                      -TableName $TableName `
                                                      -Document $item.Document `
                                                      -DatabaseType $DatabaseType
-                    
+
                     if ($success) {
+                        Sync-DocumentChildTables -Connection $sqlConnection `
+                                                 -TableName $TableName `
+                                                 -Document $item.Document `
+                                                 -ChildTables $childTables `
+                                                 -DatabaseType $DatabaseType | Out-Null
+
                         $syncResult.NewRecords++
                         $newSyncState.DocumentHashes[$item.Id] = $item.Hash
                     }
@@ -2951,8 +3019,15 @@ function Start-IncrementalSync {
                                                      -TableName $TableName `
                                                      -Document $item.Document `
                                                      -DatabaseType $DatabaseType
-                    
+
                     if ($success) {
+                        # Child rows are rewritten completely for this document
+                        Sync-DocumentChildTables -Connection $sqlConnection `
+                                                 -TableName $TableName `
+                                                 -Document $item.Document `
+                                                 -ChildTables $childTables `
+                                                 -DatabaseType $DatabaseType | Out-Null
+
                         $syncResult.UpdatedRecords++
                         $newSyncState.DocumentHashes[$item.Id] = $item.Hash
                     }
@@ -2971,6 +3046,13 @@ function Start-IncrementalSync {
             
             foreach ($id in $deletedIds) {
                 try {
+                    # Child rows first: the parent row cannot go while they
+                    # still reference it
+                    Remove-DocumentChildRows -Connection $sqlConnection `
+                                             -TableName $TableName `
+                                             -Id $id `
+                                             -ChildTables $childTables
+
                     $success = Invoke-DeleteDocument -Connection $sqlConnection `
                                                      -TableName $TableName `
                                                      -Id $id `
@@ -2999,7 +3081,15 @@ function Start-IncrementalSync {
         
         # Step 6: Save sync state
         Save-SyncState -FilePath $syncStateFile -SyncState $newSyncState
-        
+
+        # Read back the child table row counts for the summary
+        foreach ($childTable in $childTables.Values) {
+            $rowCount = Get-SQLTableRowCount -Connection $sqlConnection -TableName $childTable
+            if ($null -ne $rowCount) {
+                $syncResult.ChildRecords[$childTable] = $rowCount
+            }
+        }
+
         # Display summary
         Write-Host "`n═══════════════════════════════════════════════════════" -ForegroundColor Cyan
         Write-Host "Sync Complete!" -ForegroundColor Green
@@ -3010,12 +3100,32 @@ function Start-IncrementalSync {
         Write-Host "Updated Records: $($syncResult.UpdatedRecords)" -ForegroundColor Yellow
         Write-Host "Deleted Records: $($syncResult.DeletedRecords)" -ForegroundColor Red
         Write-Host "Unchanged: $($syncResult.UnchangedRecords)" -ForegroundColor Gray
+
+        if ($syncResult.RepairedChildRecords -gt 0) {
+            Write-Host "Repaired child rows for: $($syncResult.RepairedChildRecords) document(s)" -ForegroundColor Yellow
+        }
+
+        if ($syncResult.ChildRecords.Count -gt 0) {
+            Write-Host "`nRows per child table:" -ForegroundColor Gray
+            foreach ($childTable in ($syncResult.ChildRecords.Keys | Sort-Object)) {
+                Write-Host "  $childTable : $($syncResult.ChildRecords[$childTable])" -ForegroundColor Gray
+            }
+            Write-Host ""
+        }
+
         Write-Host "Errors: $($syncResult.Errors.Count)" -ForegroundColor $(if ($syncResult.Errors.Count -gt 0) { 'Red' } else { 'Gray' })
-        
+
+        if ($syncResult.Warnings.Count -gt 0) {
+            Write-Host "`nWarnings:" -ForegroundColor Yellow
+            foreach ($warning in $syncResult.Warnings) {
+                Write-Host "  - $warning" -ForegroundColor Yellow
+            }
+        }
+
         if ($syncResult.Errors.Count -gt 0) {
             Write-Host "`nErrors:" -ForegroundColor Red
             foreach ($err in $syncResult.Errors) {
-                Write-Host "  - $error" -ForegroundColor Red
+                Write-Host "  - $err" -ForegroundColor Red
             }
         }
         
@@ -3090,47 +3200,325 @@ function Save-SyncState {
     }
 }
 
+function ConvertTo-HashableString {
+    <#
+    .SYNOPSIS
+    Builds a stable text representation of a value, arrays and sub-documents included
+
+    .DESCRIPTION
+    Keys are sorted so the same content always produces the same text. Numbers and
+    dates are written culture independent, otherwise the same value would hash
+    differently depending on the regional settings of the machine.
+    #>
+
+    param (
+        $Value
+    )
+
+    if ($null -eq $Value) {
+        return "null"
+    }
+
+    if (Test-IsDocumentObject -Value $Value) {
+        $parts = @()
+
+        if ($Value -is [System.Collections.IDictionary]) {
+            foreach ($key in ($Value.Keys | Sort-Object)) {
+                $parts += "$key=" + (ConvertTo-HashableString -Value $Value[$key])
+            }
+        }
+        else {
+            foreach ($property in ($Value.PSObject.Properties | Sort-Object Name)) {
+                $parts += "$($property.Name)=" + (ConvertTo-HashableString -Value $property.Value)
+            }
+        }
+
+        return "{" + ($parts -join ";") + "}"
+    }
+
+    if ($Value -is [System.Collections.IEnumerable] -and $Value -isnot [string]) {
+        # Element order is part of the content: reordering an array is a change
+        $parts = @()
+        foreach ($item in $Value) {
+            $parts += ConvertTo-HashableString -Value $item
+        }
+
+        return "[" + ($parts -join ";") + "]"
+    }
+
+    if ($Value -is [double] -or $Value -is [float] -or $Value -is [decimal]) {
+        return ([double]$Value).ToString([System.Globalization.CultureInfo]::InvariantCulture)
+    }
+
+    if ($Value -is [DateTime]) {
+        return $Value.ToString("o", [System.Globalization.CultureInfo]::InvariantCulture)
+    }
+
+    return $Value.ToString()
+}
+
 function Get-DocumentHash {
     <#
     .SYNOPSIS
     Calculates a hash of a document to detect changes
+
+    .DESCRIPTION
+    Covers the whole document, including arrays and sub-documents. Hashing only
+    the scalar fields would hide a changed array, so a document whose ratings
+    changed would never be flagged for sync.
     #>
-    
+
     param (
         $Document
     )
-    
+
     try {
-        # Extract flat fields and convert to sorted JSON
-        $flatFields = @{}
-        
-        if ($Document -is [System.Collections.IDictionary]) {
-            foreach ($key in ($Document.Keys | Sort-Object)) {
-                $value = $Document[$key]
-                
-                # Only include flat fields for hash
-                if ($value -isnot [System.Collections.IEnumerable] -or $value -is [string]) {
-                    if ($value -isnot [PSCustomObject] -and $value -isnot [System.Collections.Hashtable]) {
-                        # Convert to string for consistent hashing
-                        $flatFields[$key] = if ($null -eq $value) { "" } else { $value.ToString() }
-                    }
-                }
-            }
-        }
-        
-        $json = $flatFields | ConvertTo-Json -Compress
-        
+        $content = ConvertTo-HashableString -Value $Document
+
         # Calculate MD5 hash
         $md5 = [System.Security.Cryptography.MD5]::Create()
-        $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($content)
         $hashBytes = $md5.ComputeHash($bytes)
         $hash = [System.BitConverter]::ToString($hashBytes).Replace("-", "")
-        
+
         return $hash
     }
     catch {
         Write-Host "Warning: Could not calculate hash for document" -ForegroundColor Yellow
         return [guid]::NewGuid().ToString()
+    }
+}
+
+function Get-ChildTableMap {
+    <#
+    .SYNOPSIS
+    Finds the child tables of a main table, indexed by the document field they hold
+
+    .DESCRIPTION
+    Read from the database instead of from a generated schema, so a sync does not
+    need to re-analyze the collection. A table only counts as a child table when it
+    actually has the parent key column, so an unrelated table whose name happens to
+    start with the same prefix is left alone.
+    #>
+
+    param (
+        $Connection,
+        [string]$TableName,
+        [string]$PrimaryKeyField = "_id"
+    )
+
+    $childTables = @{}
+    $parentKeyColumn = "${TableName}_${PrimaryKeyField}"
+    $candidates = @()
+
+    try {
+        # In LIKE, _ matches any single character, so it has to be escaped
+        $pattern = ($TableName -replace '_', '\_') + '\_%'
+
+        $cmd = $Connection.CreateCommand()
+        $cmd.CommandText = "SHOW TABLES LIKE '$pattern'"
+        $reader = $cmd.ExecuteReader()
+
+        while ($reader.Read()) {
+            $candidates += $reader.GetString(0)
+        }
+        $reader.Close()
+    }
+    catch {
+        Write-Host "Warning: could not list child tables of $TableName : $($_.Exception.Message)" -ForegroundColor Yellow
+        return $childTables
+    }
+
+    foreach ($candidate in $candidates) {
+        $columns = Get-SQLTableColumns -Connection $Connection -TableName $candidate
+
+        if ($columns.ContainsKey($parentKeyColumn)) {
+            $fieldName = $candidate.Substring($TableName.Length + 1)
+            $childTables[$fieldName] = $candidate
+        }
+    }
+
+    return $childTables
+}
+
+function Get-ChildRowCounts {
+    <#
+    .SYNOPSIS
+    Returns the number of child rows per parent document, in one query
+    #>
+
+    param (
+        $Connection,
+        [string]$ChildTable,
+        [string]$ParentKeyColumn
+    )
+
+    $counts = @{}
+
+    try {
+        $cmd = $Connection.CreateCommand()
+        $cmd.CommandText = 'SELECT `' + $ParentKeyColumn + '`, COUNT(*) FROM `' + $ChildTable + '` GROUP BY `' + $ParentKeyColumn + '`'
+        $reader = $cmd.ExecuteReader()
+
+        while ($reader.Read()) {
+            $counts[$reader.GetValue(0).ToString()] = [int]$reader.GetValue(1)
+        }
+        $reader.Close()
+    }
+    catch {
+        Write-Host "Warning: could not count rows of $ChildTable : $($_.Exception.Message)" -ForegroundColor Yellow
+    }
+
+    return $counts
+}
+
+function Get-ExpectedChildRowCount {
+    <#
+    .SYNOPSIS
+    Number of child rows a document should have for one field
+    #>
+
+    param (
+        $Document,
+        [string]$FieldName
+    )
+
+    if ($null -eq $Document -or $Document.Keys -notcontains $FieldName) {
+        return 0
+    }
+
+    $value = $Document[$FieldName]
+
+    if ($null -eq $value) {
+        return 0
+    }
+
+    if (Test-IsDocumentObject -Value $value) {
+        return 1
+    }
+
+    if ($value -is [System.Collections.IEnumerable] -and $value -isnot [string]) {
+        return @($value).Count
+    }
+
+    return 0
+}
+
+function Test-ChildRowDrift {
+    <#
+    .SYNOPSIS
+    Tells whether the child rows in SQL no longer match the document
+
+    .DESCRIPTION
+    Compares row counts only. That catches child rows removed or added straight in
+    SQL, which the document hash cannot see because the hash describes MongoDB.
+    A changed value inside an existing child row is not detected here: that would
+    mean reading every child row on every sync.
+    #>
+
+    param (
+        $Document,
+        [string]$DocumentId,
+        [hashtable]$ChildTables,
+        [hashtable]$ChildRowCounts
+    )
+
+    foreach ($fieldName in $ChildTables.Keys) {
+        $expected = Get-ExpectedChildRowCount -Document $Document -FieldName $fieldName
+
+        $actual = 0
+        if ($ChildRowCounts.ContainsKey($fieldName) -and $ChildRowCounts[$fieldName].ContainsKey($DocumentId)) {
+            $actual = $ChildRowCounts[$fieldName][$DocumentId]
+        }
+
+        if ($expected -ne $actual) {
+            return $true
+        }
+    }
+
+    return $false
+}
+
+function Sync-DocumentChildTables {
+    <#
+    .SYNOPSIS
+    Rewrites the child rows of one document
+
+    .DESCRIPTION
+    Every child table of the document is rewritten completely for this parent:
+    Invoke-ChildTableMigration first removes the existing rows, so the result is
+    the same no matter how often it runs. A field that disappeared from the
+    document leaves an empty child table behind for that parent.
+    #>
+
+    param (
+        $Connection,
+        [string]$TableName,
+        $Document,
+        [hashtable]$ChildTables,
+        [string]$DatabaseType,
+        [string]$PrimaryKeyField = "_id"
+    )
+
+    if ($null -eq $ChildTables -or $ChildTables.Count -eq 0) {
+        return 0
+    }
+
+    $parentId = Convert-ToSQLValue -Value $Document[$PrimaryKeyField] -DatabaseType $DatabaseType
+    $parentKeyColumn = "${TableName}_${PrimaryKeyField}"
+    $rowsWritten = 0
+
+    foreach ($fieldName in $ChildTables.Keys) {
+        $value = @()
+        if ($Document.Keys -contains $fieldName -and $null -ne $Document[$fieldName]) {
+            $value = $Document[$fieldName]
+        }
+
+        $rowsWritten += Invoke-ChildTableMigration -Connection $Connection `
+                                                   -ChildTable $ChildTables[$fieldName] `
+                                                   -ParentKeyColumn $parentKeyColumn `
+                                                   -ParentId $parentId `
+                                                   -Value $value `
+                                                   -DatabaseType $DatabaseType
+    }
+
+    return $rowsWritten
+}
+
+function Remove-DocumentChildRows {
+    <#
+    .SYNOPSIS
+    Removes the child rows of a deleted document
+    #>
+
+    param (
+        $Connection,
+        [string]$TableName,
+        [string]$Id,
+        [hashtable]$ChildTables,
+        [string]$PrimaryKeyField = "_id"
+    )
+
+    if ($null -eq $ChildTables -or $ChildTables.Count -eq 0) {
+        return
+    }
+
+    $parentKeyColumn = "${TableName}_${PrimaryKeyField}"
+
+    foreach ($childTable in $ChildTables.Values) {
+        try {
+            $cmd = $Connection.CreateCommand()
+            $cmd.CommandText = 'DELETE FROM `' + $childTable + '` WHERE `' + $parentKeyColumn + '` = ?'
+
+            $param = $cmd.CreateParameter()
+            $param.Value = $Id
+            $cmd.Parameters.Add($param) | Out-Null
+
+            $cmd.ExecuteNonQuery() | Out-Null
+        }
+        catch {
+            Write-Host "Warning: could not delete child rows in $childTable : $($_.Exception.Message)" -ForegroundColor Yellow
+        }
     }
 }
 
@@ -3504,7 +3892,7 @@ function Export-SyncReport {
         if ($SyncResult.Errors.Count -gt 0) {
             $report += "`nErrors:`n"
             foreach ($err in $SyncResult.Errors) {
-                $report += "  - $error`n"
+                $report += "  - $err`n"
             }
         }
         
