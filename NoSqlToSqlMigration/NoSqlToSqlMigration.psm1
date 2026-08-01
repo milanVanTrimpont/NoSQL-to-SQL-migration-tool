@@ -2850,7 +2850,7 @@ function Start-IncrementalSync {
         }
  
         
-        : Find the child tables holding arrays and sub-documents
+        # Step 1.6: Find the child tables holding arrays and sub-documents
         $childTables = Get-ChildTableMap -Connection $sqlConnection `
                                          -TableName $TableName `
                                          -PrimaryKeyField "_id"
@@ -3000,6 +3000,10 @@ function Start-IncrementalSync {
                         $syncResult.NewRecords++
                         $newSyncState.DocumentHashes[$item.Id] = $item.Hash
                     }
+                    else {
+                        # No hash is stored, so the next sync retries this document
+                        $syncResult.Errors += "Failed to insert document $($item.Id)"
+                    }
                 }
                 catch {
                     $syncResult.Errors += "Failed to insert document $($item.Id): $($_.Exception.Message)"
@@ -3031,6 +3035,10 @@ function Start-IncrementalSync {
                         $syncResult.UpdatedRecords++
                         $newSyncState.DocumentHashes[$item.Id] = $item.Hash
                     }
+                    else {
+                        # No hash is stored, so the next sync retries this document
+                        $syncResult.Errors += "Failed to update document $($item.Id)"
+                    }
                 }
                 catch {
                     $syncResult.Errors += "Failed to update document $($item.Id): $($_.Exception.Message)"
@@ -3060,6 +3068,9 @@ function Start-IncrementalSync {
                     
                     if ($success) {
                         $syncResult.DeletedRecords++
+                    }
+                    else {
+                        $syncResult.Errors += "Failed to delete document $id"
                     }
                 }
                 catch {
@@ -3723,7 +3734,7 @@ function Invoke-InsertDocument {
         $parameters = @()
         
         foreach ($column in $allColumns) {
-            $columns += $column
+            $columns += '`' + $column + '`'
             $values += "?"
             
             if ($documentFields.ContainsKey($column)) {
@@ -3734,7 +3745,7 @@ function Invoke-InsertDocument {
             }
         }
         
-        $insertSQL = "INSERT INTO " + $TableName + " (" + ($columns -join ', ') + ") VALUES (" + ($values -join ', ') + ")"
+        $insertSQL = "INSERT INTO " + ('`' + $TableName + '`') + " (" + ($columns -join ', ') + ") VALUES (" + ($values -join ', ') + ")"
         
         $cmd = $Connection.CreateCommand()
         $cmd.CommandText = $insertSQL
@@ -3787,14 +3798,20 @@ function Invoke-UpdateDocument {
             }
         }
         
-        # Build UPDATE
+        # Build UPDATE. A document without scalar fields (only _id, or only arrays
+        # and sub-documents) has nothing to set: the main row is already correct and
+        # an empty SET clause would be a syntax error.
         $setClauses = @()
-        
+
         foreach ($field in $flatFields.Keys) {
-            $setClauses += "$field = ?"
+            $setClauses += '`' + $field + '` = ?'
         }
-        
-        $updateSQL = "UPDATE " + $TableName + " SET " + ($setClauses -join ', ') + " WHERE _id = ?"
+
+        if ($setClauses.Count -eq 0) {
+            return $true
+        }
+
+        $updateSQL = "UPDATE " + ('`' + $TableName + '`') + " SET " + ($setClauses -join ', ') + ' WHERE `_id` = ?'
         
         $cmd = $Connection.CreateCommand()
         $cmd.CommandText = $updateSQL
@@ -3838,7 +3855,7 @@ function Invoke-DeleteDocument {
     
     try {
         $cmd = $Connection.CreateCommand()
-        $cmd.CommandText = "DELETE FROM " + $TableName + " WHERE _id = ?"
+        $cmd.CommandText = "DELETE FROM " + ('`' + $TableName + '`') + ' WHERE `_id` = ?'
         
         $param = $cmd.CreateParameter()
         $param.Value = $Id
@@ -3944,6 +3961,56 @@ function Invoke-ScheduledSync {
     return $syncResult
 }
 
+
+function Get-CollectionResultStatus {
+    <#
+    .SYNOPSIS
+    Decides whether the work for one collection really succeeded
+
+    .DESCRIPTION
+    Not throwing is not the same as succeeding: a sync catches its own errors and
+    returns a result, so the returned result has to be inspected. Warnings do not
+    count as failure - a missing child table is a hint, not a broken sync.
+    #>
+
+    param (
+        $Details
+    )
+
+    $status = @{
+        Success = $true
+        Reason  = $null
+    }
+
+    if ($null -eq $Details -or $Details -isnot [System.Collections.IDictionary]) {
+        return $status
+    }
+
+    # Incremental sync
+    if ($Details.Contains('Sync') -and $null -ne $Details['Sync']) {
+        $syncErrors = @($Details['Sync'].Errors)
+
+        if ($syncErrors.Count -gt 0) {
+            $status.Success = $false
+            $status.Reason = "sync reported $($syncErrors.Count) error(s): " + ($syncErrors -join '; ')
+            return $status
+        }
+    }
+
+    # Full migration, also used when a sync falls back to one because the
+    # table does not exist yet
+    if ($Details.Contains('Migration') -and $null -ne $Details['Migration']) {
+        $failed = $Details['Migration'].FailedDocuments
+
+        if ($failed -gt 0) {
+            $status.Success = $false
+            $status.Reason = "$failed of $($Details['Migration'].TotalDocuments) documents failed to migrate"
+            return $status
+        }
+    }
+
+    return $status
+}
 
 function Invoke-MigrationWorkflow {
     <#
@@ -4068,7 +4135,12 @@ function Invoke-MigrationWorkflow {
                     $collectionResult.Details = Invoke-IncrementalMigration -CollectionName $collectionName `
                                                                             -DatabaseType $DatabaseType `
                                                                             -SampleSize $SampleSize
-                    $collectionResult.Success = $true
+
+                    # A sync that reported errors is not a success, even though
+                    # it did not throw
+                    $status = Get-CollectionResultStatus -Details $collectionResult.Details
+                    $collectionResult.Success = $status.Success
+                    $collectionResult.Error = $status.Reason
                 }
                 
                 "ValidationOnly" {
@@ -4085,8 +4157,14 @@ function Invoke-MigrationWorkflow {
                 }
             }
             
-            $overallResults.TotalSuccess++
-            Write-Host " $collectionName completed successfully" -ForegroundColor Green
+            if ($collectionResult.Success) {
+                $overallResults.TotalSuccess++
+                Write-Host " $collectionName completed successfully" -ForegroundColor Green
+            }
+            else {
+                $overallResults.TotalFailed++
+                Write-Host " $collectionName completed with errors: $($collectionResult.Error)" -ForegroundColor Red
+            }
         }
         catch {
             $collectionResult.Error = $_.Exception.Message
