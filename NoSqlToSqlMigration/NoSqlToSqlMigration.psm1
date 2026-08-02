@@ -1,3 +1,84 @@
+function Set-N2SOutputMode {
+    <#
+    .SYNOPSIS
+    Chooses how the core reports its progress
+
+    .DESCRIPTION
+    Console - coloured output straight to the screen, for the interactive menu.
+    Stream  - the regular PowerShell streams, so an automated caller can silence
+              the progress ($InformationPreference), collect it (6>> file.log),
+              or act on warnings and errors separately (3> and 2>).
+
+    Console is the default, so the menu keeps looking exactly as it did.
+    #>
+
+    param (
+        [Parameter(Mandatory=$true)]
+        [ValidateSet('Console', 'Stream')]
+        [string]$Mode
+    )
+
+    $script:N2SOutputMode = $Mode
+}
+
+function Write-N2SMessage {
+    <#
+    .SYNOPSIS
+    Reports one message from the core, with a level instead of a colour
+
+    .DESCRIPTION
+    Core functions say what happened and how important it is, this function is
+    the only place that decides how that reaches the user. Levels map onto the
+    PowerShell streams, so detail can be hidden without hiding warnings, and a
+    warning is a real warning instead of yellow text.
+
+    .PARAMETER Message
+    The text to report.
+
+    .PARAMETER Level
+    Header  - section title
+    Step    - the step that is starting
+    Info    - normal progress
+    Success - something completed
+    Detail  - extra detail, hidden unless asked for (-Verbose)
+    Warning - something needs attention but the work continues
+    Error   - something failed
+    #>
+
+    param (
+        [Parameter(Position = 0)]
+        [AllowEmptyString()]
+        [string]$Message = '',
+
+        [ValidateSet('Header', 'Step', 'Info', 'Success', 'Detail', 'Warning', 'Error')]
+        [string]$Level = 'Info'
+    )
+
+    if ($script:N2SOutputMode -eq 'Stream') {
+        switch ($Level) {
+            'Detail'  { Write-Verbose $Message }
+            'Warning' { Write-Warning $Message }
+            'Error'   { Write-Error $Message }
+            default   { Write-Information $Message }
+        }
+
+        return
+    }
+
+    # Console: the same colours the tool has always used
+    $colour = switch ($Level) {
+        'Header'  { 'Cyan' }
+        'Step'    { 'Yellow' }
+        'Success' { 'Green' }
+        'Detail'  { 'Gray' }
+        'Warning' { 'Yellow' }
+        'Error'   { 'Red' }
+        default   { 'White' }
+    }
+
+    Write-Host $Message -ForegroundColor $colour
+}
+
 function Get-MongoDBSchema {
     <#
     .SYNOPSIS
@@ -42,21 +123,21 @@ function Get-MongoDBSchema {
     )
     
     try {
-        Write-Host "`n═══════════════════════════════════════════════════════" -ForegroundColor Cyan
-        Write-Host "    MongoDB Schema Analysis - $CollectionName" -ForegroundColor Cyan
-        Write-Host "═══════════════════════════════════════════════════════`n" -ForegroundColor Cyan
+        Write-N2SMessage "`n═══════════════════════════════════════════════════════" -Level Header
+        Write-N2SMessage "    MongoDB Schema Analysis - $CollectionName" -Level Header
+        Write-N2SMessage "═══════════════════════════════════════════════════════`n" -Level Header
         
         # Connect to MongoDB
-        Write-Host "Connecting to MongoDB..." -ForegroundColor Yellow
+        Write-N2SMessage "Connecting to MongoDB..." -Level Step
         Connect-Mdbc -ConnectionString $ConnectionString -DatabaseName $DatabaseName -CollectionName $CollectionName
         
         # Get total document count
         $totalDocs = Get-MdbcData -Count
-        Write-Host "Total documents in collection: $totalDocs" -ForegroundColor Gray
+        Write-N2SMessage "Total documents in collection: $totalDocs" -Level Detail
         
         # Determine actual sample size
         $actualSampleSize = [Math]::Min($SampleSize, $totalDocs)
-        Write-Host "Analyzing $actualSampleSize documents...`n" -ForegroundColor Gray
+        Write-N2SMessage "Analyzing $actualSampleSize documents...`n" -Level Detail
         
         # Get sample documents
         $documents = Get-MdbcData -Last $actualSampleSize
@@ -84,16 +165,16 @@ function Get-MongoDBSchema {
         Write-Progress -Activity "Analyzing documents" -Completed
         
         # Generate and display results
-        Write-Host "Schema Analysis Results:" -ForegroundColor Green
-        Write-Host "═══════════════════════════════════════════════════════`n" -ForegroundColor Cyan
+        Write-N2SMessage "Schema Analysis Results:" -Level Success
+        Write-N2SMessage "═══════════════════════════════════════════════════════`n" -Level Header
         
-        Display-SchemaResults -Schema $schema -TotalDocs $actualSampleSize
+        Show-SchemaResults -Schema $schema -TotalDocs $actualSampleSize
         
         # Return schema object for further processing
         return $schema
     }
     catch {
-        Write-Host "Error during schema analysis: $($_.Exception.Message)" -ForegroundColor Red
+        Write-N2SMessage "Error during schema analysis: $($_.Exception.Message)" -Level Error
         throw
     }
 }
@@ -120,7 +201,7 @@ function Analyze-DocumentStructure {
     
     # Safety check
     if ($null -eq $Document) {
-        Write-Host "WARNING: Null document encountered at path: $Path" -ForegroundColor Yellow
+        Write-N2SMessage "WARNING: Null document encountered at path: $Path" -Level Step
         return
     }
     
@@ -145,7 +226,7 @@ function Analyze-DocumentStructure {
         }
     }
     else {
-        Write-Host "WARNING: Unexpected document type: $($Document.GetType().FullName)" -ForegroundColor Yellow
+        Write-N2SMessage "WARNING: Unexpected document type: $($Document.GetType().FullName)" -Level Step
         return
     }
     
@@ -306,7 +387,7 @@ function Get-FieldType {
     }
 }
 
-function Display-SchemaResults {
+function Show-SchemaResults {
     <#
     .SYNOPSIS
     Displays the schema analysis results in a readable format
@@ -467,7 +548,7 @@ To ensure that all database connections are correctly configured and operational
         )
 
         try {
-            Write-Host "Testing MongoDB connection..." -ForegroundColor Cyan
+            Write-N2SMessage "Testing MongoDB connection..." -Level Header
 
             if ($CollectionName) {
                 Connect-Mdbc -ConnectionString $ConnectionString `
@@ -488,18 +569,18 @@ To ensure that all database connections are correctly configured and operational
             }
 
 
-            Write-Host "MongoDB connection successful!" -ForegroundColor Green
-            Write-Host "Database: $DatabaseName" -ForegroundColor Gray
+            Write-N2SMessage "MongoDB connection successful!" -Level Success
+            Write-N2SMessage "Database: $DatabaseName" -Level Detail
             if ($CollectionName) {
-                Write-Host "Collection: $CollectionName" -ForegroundColor Gray
+                Write-N2SMessage "Collection: $CollectionName" -Level Detail
             }
-            Write-Host "Document count: $count" -ForegroundColor Gray
+            Write-N2SMessage "Document count: $count" -Level Detail
 
             return $true
         }
         catch {
-            Write-Host "MongoDB connection failed!" -ForegroundColor Red
-            Write-Host "Error: $($_.Exception.Message)" -ForegroundColor Red
+            Write-N2SMessage "MongoDB connection failed!" -Level Error
+            Write-N2SMessage "Error: $($_.Exception.Message)" -Level Error
             return $false
         }
     }
@@ -572,7 +653,7 @@ To ensure that all database connections are correctly configured and operational
         )
 
         try {
-            Write-Host "Testing MySQL connection..." -ForegroundColor Cyan
+            Write-N2SMessage "Testing MySQL connection..." -Level Header
 
             $connectionString = "Server=$Server;Port=$Port;Database=$Database;"
 
@@ -590,17 +671,17 @@ To ensure that all database connections are correctly configured and operational
             $connection.ConnectionString = $connectionString
             $connection.Open()
 
-            Write-Host "MySQL connection successful!" -ForegroundColor Green
-            Write-Host "Server: $Server`:$Port" -ForegroundColor Gray
-            Write-Host "Database: $Database" -ForegroundColor Gray
-            Write-Host "Version: $($connection.ServerVersion)" -ForegroundColor Gray
+            Write-N2SMessage "MySQL connection successful!" -Level Success
+            Write-N2SMessage "Server: $Server`:$Port" -Level Detail
+            Write-N2SMessage "Database: $Database" -Level Detail
+            Write-N2SMessage "Version: $($connection.ServerVersion)" -Level Detail
 
             $connection.Close()
             return $true
         }
         catch {
-            Write-Host "MySQL connection failed!" -ForegroundColor Red
-            Write-Host "Error: $($_.Exception.Message)" -ForegroundColor Red
+            Write-N2SMessage "MySQL connection failed!" -Level Error
+            Write-N2SMessage "Error: $($_.Exception.Message)" -Level Error
             return $false
         }
     }
@@ -621,7 +702,7 @@ To ensure that all database connections are correctly configured and operational
         )
 
         try {
-            Write-Host "Testing SQL Server connection..." -ForegroundColor Cyan
+            Write-N2SMessage "Testing SQL Server connection..." -Level Header
 
             if ($Username -and $Password) {
                 $connectionString = "Server=$Server;Database=$Database;User Id=$Username;Password=$Password;"
@@ -635,15 +716,15 @@ To ensure that all database connections are correctly configured and operational
             $connection.Open()
             $connection.Close()
 
-            Write-Host "SQL Server connection successful!" -ForegroundColor Green
-            Write-Host "Server: $Server" -ForegroundColor Gray
-            Write-Host "Database: $Database" -ForegroundColor Gray
+            Write-N2SMessage "SQL Server connection successful!" -Level Success
+            Write-N2SMessage "Server: $Server" -Level Detail
+            Write-N2SMessage "Database: $Database" -Level Detail
 
             return $true
         }
         catch {
-            Write-Host "SQL Server connection failed!" -ForegroundColor Red
-            Write-Host "Error: $($_.Exception.Message)" -ForegroundColor Red
+            Write-N2SMessage "SQL Server connection failed!" -Level Error
+            Write-N2SMessage "Error: $($_.Exception.Message)" -Level Error
             return $false
         }
     }
@@ -655,15 +736,15 @@ To ensure that all database connections are correctly configured and operational
             [string]$DatabaseType = "MySQL"
         )
 
-        Write-Host "`n═══════════════════════════════════════════════════════" -ForegroundColor Cyan
-        Write-Host "    NoSQL to SQL Migration Tool - Connection Test" -ForegroundColor Cyan
-        Write-Host "═══════════════════════════════════════════════════════`n" -ForegroundColor Cyan
+        Write-N2SMessage "`n═══════════════════════════════════════════════════════" -Level Header
+        Write-N2SMessage "    NoSQL to SQL Migration Tool - Connection Test" -Level Header
+        Write-N2SMessage "═══════════════════════════════════════════════════════`n" -Level Header
 
         try {
             $config = Get-AppConfig
         }
         catch {
-            Write-Host $_.Exception.Message -ForegroundColor Red
+            Write-N2SMessage $_.Exception.Message -Level Error
             return $false
         }
 
@@ -673,7 +754,7 @@ To ensure that all database connections are correctly configured and operational
             -DatabaseName $config.MongoDB.Database `
             -CollectionName $config.MongoDB.Collection
 
-        Write-Host ""
+        Write-N2SMessage "" -Level Info
 
         # SQL / MySQL
         if ($DatabaseType -eq "MySQL") {
@@ -692,16 +773,16 @@ To ensure that all database connections are correctly configured and operational
                 -Password $config.SQLServer.Password
         }
 
-        Write-Host "`n═══════════════════════════════════════════════════════" -ForegroundColor Cyan
+        Write-N2SMessage "`n═══════════════════════════════════════════════════════" -Level Header
 
         if ($mongoOk -and $sqlOk) {
-            Write-Host "All database connections are successful!" -ForegroundColor Green
-            Write-Host "═══════════════════════════════════════════════════════`n" -ForegroundColor Cyan
+            Write-N2SMessage "All database connections are successful!" -Level Success
+            Write-N2SMessage "═══════════════════════════════════════════════════════`n" -Level Header
             return $true
         }
 
-        Write-Host "One or more database connections failed!" -ForegroundColor Red
-        Write-Host "═══════════════════════════════════════════════════════`n" -ForegroundColor Cyan
+        Write-N2SMessage "One or more database connections failed!" -Level Error
+        Write-N2SMessage "═══════════════════════════════════════════════════════`n" -Level Header
         return $false
     }
 
@@ -791,9 +872,9 @@ To ensure that all database connections are correctly configured and operational
         [string]$DatabaseType = "MySQL"
     )
     
-    Write-Host "`n═══════════════════════════════════════════════════════" -ForegroundColor Cyan
-    Write-Host "    Data Migration - MongoDB to $DatabaseType" -ForegroundColor Cyan
-    Write-Host "═══════════════════════════════════════════════════════`n" -ForegroundColor Cyan
+    Write-N2SMessage "`n═══════════════════════════════════════════════════════" -Level Header
+    Write-N2SMessage "    Data Migration - MongoDB to $DatabaseType" -Level Header
+    Write-N2SMessage "═══════════════════════════════════════════════════════`n" -Level Header
     
     # Initialize migration tracking
     $migrationResult = @{
@@ -809,7 +890,7 @@ To ensure that all database connections are correctly configured and operational
     
     try {
         # Step 1: Connect to databases
-        Write-Host "Step 1: Establishing connections..." -ForegroundColor Yellow
+        Write-N2SMessage "Step 1: Establishing connections..." -Level Step
         
         # Get configuration
         $config = Get-AppConfig
@@ -821,21 +902,21 @@ To ensure that all database connections are correctly configured and operational
         
         $totalDocs = Get-MdbcData -Count
         $migrationResult.TotalDocuments = $totalDocs
-        Write-Host " MongoDB connected: $totalDocs documents found" -ForegroundColor Green
+        Write-N2SMessage " MongoDB connected: $totalDocs documents found" -Level Success
         
         # Connect to SQL
         $sqlConnection = Get-SQLConnectionObject -DatabaseType $DatabaseType
         $sqlConnection.Open()
-        Write-Host " $DatabaseType connected" -ForegroundColor Green
+        Write-N2SMessage " $DatabaseType connected" -Level Success
         
         # How to handle values that do not fit their column: Warn (default),
         # Skip or Fail. Read once, because this is checked per document.
         $script:N2SConversionPolicy = Get-ConversionErrorPolicy -Config $config
         $script:N2SConversionIssues = @()
-        Write-Host " Conversion errors: $($script:N2SConversionPolicy)" -ForegroundColor Gray
+        Write-N2SMessage " Conversion errors: $($script:N2SConversionPolicy)" -Level Detail
 
         # Step 2: Create tables
-        Write-Host "`nStep 2: Creating tables..." -ForegroundColor Yellow
+        Write-N2SMessage "`nStep 2: Creating tables..." -Level Step
 
         # Column layout is read back from the database while inserting;
         # start with an empty cache because the tables are recreated below
@@ -864,11 +945,11 @@ To ensure that all database connections are correctly configured and operational
                         $tableName = $matches[1]
                         $migrationResult.TablesCreated += $tableName
                         $migrationResult.RecordsInserted[$tableName] = 0
-                        Write-Host " Created table: $tableName" -ForegroundColor Green
+                        Write-N2SMessage " Created table: $tableName" -Level Success
                     }
                 }
                 catch {
-                    Write-Host "⚠ Table creation warning: $($_.Exception.Message)" -ForegroundColor Yellow
+                    Write-N2SMessage "⚠ Table creation warning: $($_.Exception.Message)" -Level Step
                 }
             }
         }
@@ -878,8 +959,8 @@ To ensure that all database connections are correctly configured and operational
         }
         
         # Step 3: Migrate data
-        Write-Host "`nStep 3: Migrating data..." -ForegroundColor Yellow
-        Write-Host "Processing $totalDocs documents in batches of $BatchSize..." -ForegroundColor Gray
+        Write-N2SMessage "`nStep 3: Migrating data..." -Level Step
+        Write-N2SMessage "Processing $totalDocs documents in batches of $BatchSize..." -Level Detail
         
         $processedCount = 0
         $batchNumber = 0
@@ -921,11 +1002,11 @@ To ensure that all database connections are correctly configured and operational
                         Error = $_.Exception.Message
                         Timestamp = Get-Date
                     }
-                    Write-Host " Failed to migrate document: $($doc._id)" -ForegroundColor Red
+                    Write-N2SMessage " Failed to migrate document: $($doc._id)" -Level Error
                 }
             }
             
-            Write-Host " Batch $batchNumber complete: $processedCount/$totalDocs documents processed" -ForegroundColor Gray
+            Write-N2SMessage " Batch $batchNumber complete: $processedCount/$totalDocs documents processed" -Level Detail
         }
         
         Write-Progress -Activity "Migrating documents" -Completed
@@ -942,17 +1023,17 @@ To ensure that all database connections are correctly configured and operational
         $migrationResult.EndTime = Get-Date
         $duration = $migrationResult.EndTime - $migrationResult.StartTime
 
-        Write-Host "`n═══════════════════════════════════════════════════════" -ForegroundColor Cyan
-        Write-Host "Migration Complete!" -ForegroundColor Green
-        Write-Host "═══════════════════════════════════════════════════════" -ForegroundColor Cyan
-        Write-Host "Duration: $($duration.TotalSeconds) seconds" -ForegroundColor Gray
-        Write-Host "Total documents: $($migrationResult.TotalDocuments)" -ForegroundColor Gray
-        Write-Host "Successfully migrated: $($migrationResult.MigratedDocuments)" -ForegroundColor Green
-        Write-Host "Failed: $($migrationResult.FailedDocuments)" -ForegroundColor $(if ($migrationResult.FailedDocuments -gt 0) { "Red" } else { "Gray" })
+        Write-N2SMessage "`n═══════════════════════════════════════════════════════" -Level Header
+        Write-N2SMessage "Migration Complete!" -Level Success
+        Write-N2SMessage "═══════════════════════════════════════════════════════" -Level Header
+        Write-N2SMessage "Duration: $($duration.TotalSeconds) seconds" -Level Detail
+        Write-N2SMessage "Total documents: $($migrationResult.TotalDocuments)" -Level Detail
+        Write-N2SMessage "Successfully migrated: $($migrationResult.MigratedDocuments)" -Level Success
+        Write-N2SMessage "Failed: $($migrationResult.FailedDocuments)" -Level $(if ($migrationResult.FailedDocuments -gt 0) { 'Error' } else { 'Detail' })
         
-        Write-Host "`nRecords per table:" -ForegroundColor Yellow
+        Write-N2SMessage "`nRecords per table:" -Level Step
         foreach ($table in $migrationResult.RecordsInserted.Keys | Sort-Object) {
-            Write-Host "  $table : $($migrationResult.RecordsInserted[$table])" -ForegroundColor Gray
+            Write-N2SMessage "  $table : $($migrationResult.RecordsInserted[$table])" -Level Detail
         }
 
         # Values that did not fit their column, so nothing disappears unnoticed
@@ -961,37 +1042,37 @@ To ensure that all database connections are correctly configured and operational
         if ($migrationResult.ConversionIssues.Count -gt 0) {
             $affectedDocuments = @($migrationResult.ConversionIssues | Select-Object -ExpandProperty Document -Unique).Count
 
-            Write-Host "`nConversion problems: $($migrationResult.ConversionIssues.Count) value(s) in $affectedDocuments document(s)" -ForegroundColor Yellow
+            Write-N2SMessage "`nConversion problems: $($migrationResult.ConversionIssues.Count) value(s) in $affectedDocuments document(s)" -Level Step
 
             foreach ($issue in ($migrationResult.ConversionIssues | Select-Object -First 5)) {
-                Write-Host "  $($issue.Table).$($issue.Field): $($issue.Reason) -> $($issue.Action)" -ForegroundColor Yellow
+                Write-N2SMessage "  $($issue.Table).$($issue.Field): $($issue.Reason) -> $($issue.Action)" -Level Step
             }
 
             if ($migrationResult.ConversionIssues.Count -gt 5) {
-                Write-Host "  ... and $($migrationResult.ConversionIssues.Count - 5) more" -ForegroundColor Yellow
+                Write-N2SMessage "  ... and $($migrationResult.ConversionIssues.Count - 5) more" -Level Step
             }
 
             $reportPath = ".\conversion_report_$($SQLSchema.MainTable)_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
             $written = Export-ConversionReport -Issues $migrationResult.ConversionIssues -OutputPath $reportPath
 
             if ($written) {
-                Write-Host "  Full report: $written" -ForegroundColor Gray
+                Write-N2SMessage "  Full report: $written" -Level Detail
             }
         }
         
         if ($migrationResult.Errors.Count -gt 0) {
-            Write-Host "`nErrors encountered:" -ForegroundColor Red
+            Write-N2SMessage "`nErrors encountered:" -Level Error
             $migrationResult.Errors | ForEach-Object {
-                Write-Host "  Document $($_.Document): $($_.Error)" -ForegroundColor Red
+                Write-N2SMessage "  Document $($_.Document): $($_.Error)" -Level Error
             }
         }
         
-        Write-Host "═══════════════════════════════════════════════════════`n" -ForegroundColor Cyan
+        Write-N2SMessage "═══════════════════════════════════════════════════════`n" -Level Header
         
         return $migrationResult
     }
     catch {
-        Write-Host "`n Migration failed: $($_.Exception.Message)" -ForegroundColor Red
+        Write-N2SMessage "`n Migration failed: $($_.Exception.Message)" -Level Error
         throw
     }
     finally {
@@ -1110,7 +1191,7 @@ function Get-SQLTableColumns {
         $script:N2STableColumns[$TableName] = $columns
     }
     catch {
-        Write-Host "Warning: could not read columns of table $TableName : $($_.Exception.Message)" -ForegroundColor Yellow
+        Write-N2SMessage "Warning: could not read columns of table $TableName : $($_.Exception.Message)" -Level Step
     }
 
     return $columns
@@ -1602,7 +1683,7 @@ function Export-ConversionReport {
         return $OutputPath
     }
     catch {
-        Write-Host "Warning: could not write conversion report: $($_.Exception.Message)" -ForegroundColor Yellow
+        Write-N2SMessage "Warning: could not write conversion report: $($_.Exception.Message)" -Level Step
         return $null
     }
 }
@@ -1681,7 +1762,7 @@ function Invoke-DocumentMigration {
                 'Skip' {
                     Add-ConversionIssue -TableName $TableName -DocumentId $documentId -FieldName $field `
                                         -Reason $converted.Reason -Action 'document skipped'
-                    Write-Host "Skipped document $documentId : $($converted.Reason)" -ForegroundColor Yellow
+                    Write-N2SMessage "Skipped document $documentId : $($converted.Reason)" -Level Step
                     return $false
                 }
                 default {
@@ -1694,7 +1775,7 @@ function Invoke-DocumentMigration {
         }
 
         if ($row.Count -eq 0) {
-            Write-Host "Error migrating document: no matching columns in table $TableName" -ForegroundColor Red
+            Write-N2SMessage "Error migrating document: no matching columns in table $TableName" -Level Error
             return $false
         }
 
@@ -1725,7 +1806,7 @@ function Invoke-DocumentMigration {
         return $true
     }
     catch {
-        Write-Host "Error migrating document: $($_.Exception.Message)" -ForegroundColor Red
+        Write-N2SMessage "Error migrating document: $($_.Exception.Message)" -Level Error
         return $false
     }
 }
@@ -1910,12 +1991,12 @@ function Export-MigrationLog {
         }
         
         $log | Out-File -FilePath $OutputPath -Encoding UTF8
-        Write-Host "Migration log exported to: $OutputPath" -ForegroundColor Green
+        Write-N2SMessage "Migration log exported to: $OutputPath" -Level Success
         
         return $true
     }
     catch {
-        Write-Host "Error exporting log: $($_.Exception.Message)" -ForegroundColor Red
+        Write-N2SMessage "Error exporting log: $($_.Exception.Message)" -Level Error
         return $false
     }
 }
@@ -1964,9 +2045,9 @@ function New-SQLSchema {
         [bool]$IncludeDropStatements = $true
     )
     
-    Write-Host "`n═══════════════════════════════════════════════════════" -ForegroundColor Cyan
-    Write-Host "    SQL Schema Generation - $TableName" -ForegroundColor Cyan
-    Write-Host "═══════════════════════════════════════════════════════`n" -ForegroundColor Cyan
+    Write-N2SMessage "`n═══════════════════════════════════════════════════════" -Level Header
+    Write-N2SMessage "    SQL Schema Generation - $TableName" -Level Header
+    Write-N2SMessage "═══════════════════════════════════════════════════════`n" -Level Header
     
     # Initialize result object
     $result = @{
@@ -2009,14 +2090,14 @@ function New-SQLSchema {
         }
     }
     
-    Write-Host "Analysis:" -ForegroundColor Yellow
-    Write-Host "  Flat fields: $($flatFields.Keys.Count)" -ForegroundColor Gray
-    Write-Host "  Nested objects: $($nestedObjects.Keys.Count)" -ForegroundColor Gray
-    Write-Host "  Array fields: $($arrayFields.Keys.Count)" -ForegroundColor Gray
-    Write-Host ""
+    Write-N2SMessage "Analysis:" -Level Step
+    Write-N2SMessage "  Flat fields: $($flatFields.Keys.Count)" -Level Detail
+    Write-N2SMessage "  Nested objects: $($nestedObjects.Keys.Count)" -Level Detail
+    Write-N2SMessage "  Array fields: $($arrayFields.Keys.Count)" -Level Detail
+    Write-N2SMessage "" -Level Info
     
     # Generate main table
-    Write-Host "Generating main table: $TableName" -ForegroundColor Green
+    Write-N2SMessage "Generating main table: $TableName" -Level Success
     $mainTableSQL = New-TableDefinition -TableName $TableName `
                                        -Fields $flatFields `
                                        -PrimaryKeyField $PrimaryKeyField `
@@ -2029,7 +2110,7 @@ function New-SQLSchema {
     # Generate tables for nested objects
     foreach ($nestedPath in $nestedObjects.Keys) {
         $nestedTableName = "${TableName}_${nestedPath}"
-        Write-Host "Generating nested table: $nestedTableName" -ForegroundColor Green
+        Write-N2SMessage "Generating nested table: $nestedTableName" -Level Success
         
         # Get all fields that belong to this nested object
         $nestedFields = @{}
@@ -2056,7 +2137,7 @@ function New-SQLSchema {
     # Generate tables for arrays
     foreach ($arrayPath in $arrayFields.Keys) {
         $arrayTableName = "${TableName}_${arrayPath}"
-        Write-Host "Generating array table: $arrayTableName" -ForegroundColor Green
+        Write-N2SMessage "Generating array table: $arrayTableName" -Level Success
         
         $arrayInfo = $arrayFields[$arrayPath]
         
@@ -2099,17 +2180,17 @@ function New-SQLSchema {
     }
     
     # Display summary
-    Write-Host "`n═══════════════════════════════════════════════════════" -ForegroundColor Cyan
-    Write-Host "Schema Generation Complete!" -ForegroundColor Green
-    Write-Host "═══════════════════════════════════════════════════════" -ForegroundColor Cyan
-    Write-Host "Tables created: $($result.Tables.Count)" -ForegroundColor Gray
-    $result.Tables | ForEach-Object { Write-Host "  - $_" -ForegroundColor Gray }
+    Write-N2SMessage "`n═══════════════════════════════════════════════════════" -Level Header
+    Write-N2SMessage "Schema Generation Complete!" -Level Success
+    Write-N2SMessage "═══════════════════════════════════════════════════════" -Level Header
+    Write-N2SMessage "Tables created: $($result.Tables.Count)" -Level Detail
+    $result.Tables | ForEach-Object { Write-N2SMessage "  - $_" -Level Detail }
     
     if ($result.Relationships.Count -gt 0) {
-        Write-Host "`nRelationships:" -ForegroundColor Yellow
-        $result.Relationships | ForEach-Object { Write-Host "  $_" -ForegroundColor Gray }
+        Write-N2SMessage "`nRelationships:" -Level Step
+        $result.Relationships | ForEach-Object { Write-N2SMessage "  $_" -Level Detail }
     }
-    Write-Host "═══════════════════════════════════════════════════════`n" -ForegroundColor Cyan
+    Write-N2SMessage "═══════════════════════════════════════════════════════`n" -Level Header
     
     return $result
 }
@@ -2439,11 +2520,11 @@ function Export-SQLSchema {
         
         $content | Out-File -FilePath $OutputPath -Encoding UTF8
         
-        Write-Host "SQL schema exported to: $OutputPath" -ForegroundColor Green
+        Write-N2SMessage "SQL schema exported to: $OutputPath" -Level Success
         return $true
     }
     catch {
-        Write-Host "Error exporting SQL schema: $($_.Exception.Message)" -ForegroundColor Red
+        Write-N2SMessage "Error exporting SQL schema: $($_.Exception.Message)" -Level Error
         return $false
     }
 }
@@ -2459,23 +2540,23 @@ function Test-SQLSchemaGeneration {
     $config = Get-AppConfig
     
     # Analyze MongoDB schema
-    Write-Host "Step 1: Analyzing MongoDB collection..." -ForegroundColor Yellow
+    Write-N2SMessage "Step 1: Analyzing MongoDB collection..." -Level Step
     $schema = Get-MongoDBSchema -ConnectionString $config.MongoDB.ConnectionString `
                                 -DatabaseName $config.MongoDB.Database `
                                 -CollectionName $config.MongoDB.Collection `
                                 -SampleSize 100
     
     # Generate SQL schema
-    Write-Host "`nStep 2: Generating SQL schema..." -ForegroundColor Yellow
+    Write-N2SMessage "`nStep 2: Generating SQL schema..." -Level Step
     $sqlSchema = New-SQLSchema -Schema $schema `
                                -TableName $config.MongoDB.Collection `
                                -PrimaryKeyField "_id"
     
     # Display generated SQL
-    Write-Host "`nGenerated SQL Statements:" -ForegroundColor Cyan
-    Write-Host "═══════════════════════════════════════════════════════" -ForegroundColor Cyan
+    Write-N2SMessage "`nGenerated SQL Statements:" -Level Header
+    Write-N2SMessage "═══════════════════════════════════════════════════════" -Level Header
     foreach ($statement in $sqlSchema.Statements) {
-        Write-Host $statement -ForegroundColor White
+        Write-N2SMessage $statement -Level Info
     }
     
     # Export to file
@@ -2502,9 +2583,9 @@ function Invoke-CompleteMigration {
         [string]$DatabaseType = "MySQL"
     )
     
-    Write-Host "`n" + ("="*60) -ForegroundColor Cyan
-    Write-Host "  Complete MongoDB to $DatabaseType Migration Workflow" -ForegroundColor Cyan
-    Write-Host ("="*60) + "`n" -ForegroundColor Cyan
+    Write-N2SMessage "`n$('=' * 60)" -Level Header
+    Write-N2SMessage "  Complete MongoDB to $DatabaseType Migration Workflow" -Level Header
+    Write-N2SMessage "$('=' * 60)`n" -Level Header
     
     # Get configuration
     $config = Get-AppConfig
@@ -2514,14 +2595,14 @@ function Invoke-CompleteMigration {
     }
     
     # Step 1: Analyze MongoDB schema
-    Write-Host "Phase 1: Schema Analysis" -ForegroundColor Yellow
+    Write-N2SMessage "Phase 1: Schema Analysis" -Level Step
     $schema = Get-MongoDBSchema -ConnectionString $config.MongoDB.ConnectionString `
                                 -DatabaseName $config.MongoDB.Database `
                                 -CollectionName $collectionName `
                                 -SampleSize $SampleSize
     
     # Step 2: Generate SQL schema
-    Write-Host "`nPhase 2: SQL Schema Generation" -ForegroundColor Yellow
+    Write-N2SMessage "`nPhase 2: SQL Schema Generation" -Level Step
     $sqlSchema = New-SQLSchema -Schema $schema `
                                -TableName $collectionName `
                                -PrimaryKeyField "_id"
@@ -2531,7 +2612,7 @@ function Invoke-CompleteMigration {
     Export-SQLSchema -SchemaResult $sqlSchema -OutputPath $schemaFile
     
     # Step 3: Migrate data
-    Write-Host "`nPhase 3: Data Migration" -ForegroundColor Yellow
+    Write-N2SMessage "`nPhase 3: Data Migration" -Level Step
     $migrationResult = Start-DataMigration -Schema $schema `
                                            -SQLSchema $sqlSchema `
                                            -CollectionName $collectionName `
@@ -2542,9 +2623,9 @@ function Invoke-CompleteMigration {
     $logFile = ".\migration_log_$(Get-Date -Format 'yyyyMMdd_HHmmss').txt"
     Export-MigrationLog -MigrationResult $migrationResult -OutputPath $logFile
     
-    Write-Host "`n Complete migration workflow finished!" -ForegroundColor Green
-    Write-Host "  Schema file: $schemaFile" -ForegroundColor Gray
-    Write-Host "  Log file: $logFile" -ForegroundColor Gray
+    Write-N2SMessage "`n Complete migration workflow finished!" -Level Success
+    Write-N2SMessage "  Schema file: $schemaFile" -Level Detail
+    Write-N2SMessage "  Log file: $logFile" -Level Detail
     
     return $migrationResult
 }
@@ -2586,9 +2667,9 @@ function Test-MigrationValidation {
         [string]$DatabaseType = "MySQL"
     )
     
-    Write-Host "`n═══════════════════════════════════════════════════════" -ForegroundColor Cyan
-    Write-Host "    Migration Validation - $TableName" -ForegroundColor Cyan
-    Write-Host "═══════════════════════════════════════════════════════`n" -ForegroundColor Cyan
+    Write-N2SMessage "`n═══════════════════════════════════════════════════════" -Level Header
+    Write-N2SMessage "    Migration Validation - $TableName" -Level Header
+    Write-N2SMessage "═══════════════════════════════════════════════════════`n" -Level Header
     
     # Initialize validation result
     $validationResult = @{
@@ -2608,7 +2689,7 @@ function Test-MigrationValidation {
     
     try {
         # Step 1: Connect to databases
-        Write-Host "Step 1: Connecting to databases..." -ForegroundColor Yellow
+        Write-N2SMessage "Step 1: Connecting to databases..." -Level Step
         
         # Get configuration
         $config = Get-AppConfig
@@ -2619,7 +2700,7 @@ function Test-MigrationValidation {
                      -CollectionName $TableName
         
         $validationResult.MongoCount = Get-MdbcData -Count
-        Write-Host " MongoDB: $($validationResult.MongoCount) documents" -ForegroundColor Green
+        Write-N2SMessage " MongoDB: $($validationResult.MongoCount) documents" -Level Success
         
         # SQL connection
         $sqlConnection = Get-SQLConnectionObject -DatabaseType $DatabaseType
@@ -2629,23 +2710,23 @@ function Test-MigrationValidation {
         $countQuery = "SELECT COUNT(*) FROM ``" + $TableName + "``"
         $sqlCmd.CommandText = $countQuery
         $validationResult.SQLCount = [int]$sqlCmd.ExecuteScalar()
-        Write-Host " $DatabaseType : $($validationResult.SQLCount) records" -ForegroundColor Green
+        Write-N2SMessage " $DatabaseType : $($validationResult.SQLCount) records" -Level Success
         
         # Step 2: Compare record counts
-        Write-Host "`nStep 2: Comparing record counts..." -ForegroundColor Yellow
+        Write-N2SMessage "`nStep 2: Comparing record counts..." -Level Step
         
         if ($validationResult.MongoCount -eq $validationResult.SQLCount) {
-            Write-Host " Record counts match!" -ForegroundColor Green
+            Write-N2SMessage " Record counts match!" -Level Success
             $validationResult.RecordCountMatch = $true
         }
         else {
             $diff = [Math]::Abs($validationResult.MongoCount - $validationResult.SQLCount)
-            Write-Host " Record count mismatch! Difference: $diff records" -ForegroundColor Red
+            Write-N2SMessage " Record count mismatch! Difference: $diff records" -Level Error
             $validationResult.Issues += "Record count mismatch: MongoDB=$($validationResult.MongoCount), SQL=$($validationResult.SQLCount)"
         }
         
         # Step 3: Validate sample data
-        Write-Host "`nStep 3: Validating sample data..." -ForegroundColor Yellow
+        Write-N2SMessage "`nStep 3: Validating sample data..." -Level Step
         
         $actualSampleSize = [Math]::Min($SampleSize, $validationResult.MongoCount)
         $validationResult.SamplesValidated = $actualSampleSize
@@ -2670,7 +2751,7 @@ function Test-MigrationValidation {
                 if ($null -eq $sqlRecord) {
                     $validationResult.SamplesFailed++
                     $validationResult.Issues += "Document $docId not found in SQL database"
-                    Write-Host " Document $docId not found in SQL" -ForegroundColor Red
+                    Write-N2SMessage " Document $docId not found in SQL" -Level Error
                 }
                 else {
                     # Compare fields
@@ -2680,12 +2761,12 @@ function Test-MigrationValidation {
                     
                     if ($comparisonResult.Match) {
                         $validationResult.SamplesPassed++
-                        Write-Host " Document $docId validated successfully" -ForegroundColor Green
+                        Write-N2SMessage " Document $docId validated successfully" -Level Success
                     }
                     else {
                         $validationResult.SamplesFailed++
                         $validationResult.Issues += "Document $docId has mismatches: $($comparisonResult.Differences -join ', ')"
-                        Write-Host " Document $docId has differences: $($comparisonResult.Differences -join ', ')" -ForegroundColor Red
+                        Write-N2SMessage " Document $docId has differences: $($comparisonResult.Differences -join ', ')" -Level Error
                     }
                     
                     $validationResult.Details += $comparisonResult
@@ -2696,18 +2777,18 @@ function Test-MigrationValidation {
         }
         
         # Step 4: Data integrity checks
-        Write-Host "`nStep 4: Checking data integrity..." -ForegroundColor Yellow
+        Write-N2SMessage "`nStep 4: Checking data integrity..." -Level Step
         
         $integrityIssues = Test-DataIntegrity -Connection $sqlConnection `
                                               -TableName $TableName `
                                               -DatabaseType $DatabaseType
         
         if ($integrityIssues.Count -eq 0) {
-            Write-Host " No integrity issues found" -ForegroundColor Green
+            Write-N2SMessage " No integrity issues found" -Level Success
         }
         else {
             foreach ($issue in $integrityIssues) {
-                Write-Host "⚠ $issue" -ForegroundColor Yellow
+                Write-N2SMessage "⚠ $issue" -Level Step
                 $validationResult.Warnings += $issue
             }
         }
@@ -2715,49 +2796,49 @@ function Test-MigrationValidation {
         # Determine overall status
         if ($validationResult.Issues.Count -eq 0) {
             $validationResult.OverallStatus = "PASSED"
-            $statusColor = "Green"
+            $statusLevel = "Success"
         }
         elseif ($validationResult.SamplesPassed -gt $validationResult.SamplesFailed) {
             $validationResult.OverallStatus = "PARTIAL"
-            $statusColor = "Yellow"
+            $statusLevel = "Warning"
         }
         else {
             $validationResult.OverallStatus = "FAILED"
-            $statusColor = "Red"
+            $statusLevel = "Error"
         }
         
         # Display summary
-        Write-Host "`n═══════════════════════════════════════════════════════" -ForegroundColor Cyan
-        Write-Host "Validation Summary" -ForegroundColor Cyan
-        Write-Host "═══════════════════════════════════════════════════════" -ForegroundColor Cyan
-        Write-Host "Overall Status: $($validationResult.OverallStatus)" -ForegroundColor $statusColor
-        Write-Host "Record Count Match: $(if ($validationResult.RecordCountMatch) { 'YES' } else { 'NO' })" -ForegroundColor $(if ($validationResult.RecordCountMatch) { 'Green' } else { 'Red' })
-        Write-Host "Samples Validated: $($validationResult.SamplesValidated)" -ForegroundColor Gray
-        Write-Host "  - Passed: $($validationResult.SamplesPassed)" -ForegroundColor Green
-        Write-Host "  - Failed: $($validationResult.SamplesFailed)" -ForegroundColor $(if ($validationResult.SamplesFailed -gt 0) { 'Red' } else { 'Gray' })
-        Write-Host "Issues Found: $($validationResult.Issues.Count)" -ForegroundColor $(if ($validationResult.Issues.Count -gt 0) { 'Red' } else { 'Green' })
-        Write-Host "Warnings: $($validationResult.Warnings.Count)" -ForegroundColor $(if ($validationResult.Warnings.Count -gt 0) { 'Yellow' } else { 'Gray' })
+        Write-N2SMessage "`n═══════════════════════════════════════════════════════" -Level Header
+        Write-N2SMessage "Validation Summary" -Level Header
+        Write-N2SMessage "═══════════════════════════════════════════════════════" -Level Header
+        Write-N2SMessage "Overall Status: $($validationResult.OverallStatus)" -Level $statusLevel
+        Write-N2SMessage "Record Count Match: $(if ($validationResult.RecordCountMatch) { 'YES' } else { 'NO' })" -Level $(if ($validationResult.RecordCountMatch) { 'Success' } else { 'Error' })
+        Write-N2SMessage "Samples Validated: $($validationResult.SamplesValidated)" -Level Detail
+        Write-N2SMessage "  - Passed: $($validationResult.SamplesPassed)" -Level Success
+        Write-N2SMessage "  - Failed: $($validationResult.SamplesFailed)" -Level $(if ($validationResult.SamplesFailed -gt 0) { 'Error' } else { 'Detail' })
+        Write-N2SMessage "Issues Found: $($validationResult.Issues.Count)" -Level $(if ($validationResult.Issues.Count -gt 0) { 'Error' } else { 'Success' })
+        Write-N2SMessage "Warnings: $($validationResult.Warnings.Count)" -Level $(if ($validationResult.Warnings.Count -gt 0) { 'Warning' } else { 'Detail' })
         
         if ($validationResult.Issues.Count -gt 0) {
-            Write-Host "`nIssues:" -ForegroundColor Red
+            Write-N2SMessage "`nIssues:" -Level Error
             foreach ($issue in $validationResult.Issues) {
-                Write-Host "  - $issue" -ForegroundColor Red
+                Write-N2SMessage "  - $issue" -Level Error
             }
         }
         
         if ($validationResult.Warnings.Count -gt 0) {
-            Write-Host "`nWarnings:" -ForegroundColor Yellow
+            Write-N2SMessage "`nWarnings:" -Level Step
             foreach ($warning in $validationResult.Warnings) {
-                Write-Host "  - $warning" -ForegroundColor Yellow
+                Write-N2SMessage "  - $warning" -Level Step
             }
         }
         
-        Write-Host "═══════════════════════════════════════════════════════`n" -ForegroundColor Cyan
+        Write-N2SMessage "═══════════════════════════════════════════════════════`n" -Level Header
         
         return $validationResult
     }
     catch {
-        Write-Host "`n Validation failed: $($_.Exception.Message)" -ForegroundColor Red
+        Write-N2SMessage "`n Validation failed: $($_.Exception.Message)" -Level Error
         $validationResult.OverallStatus = "ERROR"
         $validationResult.Issues += "Validation error: $($_.Exception.Message)"
         return $validationResult
@@ -2809,7 +2890,7 @@ function Get-SQLRecord {
         return $null
     }
     catch {
-        Write-Host "Error retrieving SQL record: $($_.Exception.Message)" -ForegroundColor Red
+        Write-N2SMessage "Error retrieving SQL record: $($_.Exception.Message)" -Level Error
         return $null
     }
 }
@@ -3133,12 +3214,12 @@ function Export-ValidationReport {
 "@
         
         $html | Out-File -FilePath $OutputPath -Encoding UTF8
-        Write-Host "Validation report exported to: $OutputPath" -ForegroundColor Green
+        Write-N2SMessage "Validation report exported to: $OutputPath" -Level Success
         
         return $true
     }
     catch {
-        Write-Host "Error exporting validation report: $($_.Exception.Message)" -ForegroundColor Red
+        Write-N2SMessage "Error exporting validation report: $($_.Exception.Message)" -Level Error
         return $false
     }
 }
@@ -3161,9 +3242,9 @@ function Invoke-CompleteValidation {
         [string]$DatabaseType = "MySQL"
     )
     
-    Write-Host "`n" + ("="*60) -ForegroundColor Cyan
-    Write-Host "  Complete Migration Validation" -ForegroundColor Cyan
-    Write-Host ("="*60) + "`n" -ForegroundColor Cyan
+    Write-N2SMessage "`n$('=' * 60)" -Level Header
+    Write-N2SMessage "  Complete Migration Validation" -Level Header
+    Write-N2SMessage "$('=' * 60)`n" -Level Header
     
     # Run validation
     $validationResult = Test-MigrationValidation -TableName $TableName `
@@ -3174,9 +3255,9 @@ function Invoke-CompleteValidation {
     $reportFile = ".\validation_report_$(Get-Date -Format 'yyyyMMdd_HHmmss').html"
     Export-ValidationReport -ValidationResult $validationResult -OutputPath $reportFile
     
-    Write-Host "`n Validation complete!" -ForegroundColor Green
-    Write-Host "  Report file: $reportFile" -ForegroundColor Gray
-    Write-Host "  Open the HTML file in your browser to view the detailed report.`n" -ForegroundColor Gray
+    Write-N2SMessage "`n Validation complete!" -Level Success
+    Write-N2SMessage "  Report file: $reportFile" -Level Detail
+    Write-N2SMessage "  Open the HTML file in your browser to view the detailed report.`n" -Level Detail
     
     return $validationResult
 }
@@ -3219,9 +3300,9 @@ function Start-IncrementalSync {
         [switch]$ForceFullSync
     )
     
-    Write-Host "`n═══════════════════════════════════════════════════════" -ForegroundColor Cyan
-    Write-Host "    Incremental Sync - $TableName" -ForegroundColor Cyan
-    Write-Host "═══════════════════════════════════════════════════════`n" -ForegroundColor Cyan
+    Write-N2SMessage "`n═══════════════════════════════════════════════════════" -Level Header
+    Write-N2SMessage "    Incremental Sync - $TableName" -Level Header
+    Write-N2SMessage "═══════════════════════════════════════════════════════`n" -Level Header
     
     # Initialize sync result
     $syncResult = @{
@@ -3249,16 +3330,16 @@ function Start-IncrementalSync {
         $syncState = Get-SyncState -FilePath $syncStateFile
         
         if ($ForceFullSync -or $null -eq $syncState) {
-            Write-Host "Performing FULL SYNC..." -ForegroundColor Yellow
+            Write-N2SMessage "Performing FULL SYNC..." -Level Step
             $syncResult.IsFullSync = $true
         }
         else {
-            Write-Host "Performing INCREMENTAL SYNC since $($syncState.LastSyncTime)" -ForegroundColor Yellow
+            Write-N2SMessage "Performing INCREMENTAL SYNC since $($syncState.LastSyncTime)" -Level Step
             $syncResult.LastSyncTime = $syncState.LastSyncTime
         }
         
         # Step 2: Connect to databases
-        Write-Host "`nStep 1: Connecting to databases..." -ForegroundColor Yellow
+        Write-N2SMessage "`nStep 1: Connecting to databases..." -Level Step
         
         # Get configuration
         $config = Get-AppConfig
@@ -3269,25 +3350,25 @@ function Start-IncrementalSync {
                      -CollectionName $TableName
         
         $mongoDocuments = Get-MdbcData
-        Write-Host " MongoDB: $($mongoDocuments.Count) documents" -ForegroundColor Green
+        Write-N2SMessage " MongoDB: $($mongoDocuments.Count) documents" -Level Success
         
         # SQL
         $sqlConnection = Get-SQLConnectionObject -DatabaseType $DatabaseType
         $sqlConnection.Open()
-        Write-Host " SQL connected" -ForegroundColor Green
+        Write-N2SMessage " SQL connected" -Level Success
         
         # Step 2.5: Check and update schema if needed
-        Write-Host "`nStep 1.5: Checking for schema changes..." -ForegroundColor Yellow
+        Write-N2SMessage "`nStep 1.5: Checking for schema changes..." -Level Step
         $schemaUpdated = Update-SQLSchema -Connection $sqlConnection `
                                          -TableName $TableName `
                                          -MongoDocuments $mongoDocuments `
                                          -DatabaseType $DatabaseType
         
         if ($schemaUpdated) {
-            Write-Host " Schema updated with new columns" -ForegroundColor Green
+            Write-N2SMessage " Schema updated with new columns" -Level Success
         }
         else {
-            Write-Host " Schema is up to date" -ForegroundColor Gray
+            Write-N2SMessage " Schema is up to date" -Level Detail
         }
  
         
@@ -3300,7 +3381,7 @@ function Start-IncrementalSync {
         $childRowCounts = @{}
 
         if ($childTables.Count -gt 0) {
-            Write-Host " Child tables: $(($childTables.Values | Sort-Object) -join ', ')" -ForegroundColor Gray
+            Write-N2SMessage " Child tables: $(($childTables.Values | Sort-Object) -join ', ')" -Level Detail
 
             #  
             foreach ($fieldName in $childTables.Keys) {
@@ -3328,20 +3409,20 @@ function Start-IncrementalSync {
         }
 
         foreach ($fieldName in ($missingChildFields.Keys | Sort-Object)) {
-            Write-Host " Field '$fieldName' has no child table - run a Full Migration to create it" -ForegroundColor Yellow
+            Write-N2SMessage " Field '$fieldName' has no child table - run a Full Migration to create it" -Level Step
             $syncResult.Warnings += "Field '$fieldName' has no child table; run a Full Migration for $TableName"
         }
 
         # Step 3: Get current SQL records
-        Write-Host "`nStep 2: Loading existing SQL records..." -ForegroundColor Yellow
+        Write-N2SMessage "`nStep 2: Loading existing SQL records..." -Level Step
         $existingRecords = Get-AllSQLRecords -Connection $sqlConnection `
                                             -TableName $TableName `
                                             -DatabaseType $DatabaseType
         
-        Write-Host " Loaded $($existingRecords.Count) existing SQL records" -ForegroundColor Green
+        Write-N2SMessage " Loaded $($existingRecords.Count) existing SQL records" -Level Success
         
         # Step 4: Detect changes
-        Write-Host "`nStep 3: Detecting changes..." -ForegroundColor Yellow
+        Write-N2SMessage "`nStep 3: Detecting changes..." -Level Step
         
         $mongoIds = @{}
         $newDocs = @()
@@ -3407,13 +3488,13 @@ function Start-IncrementalSync {
             }
         }
         
-        Write-Host "  New documents: $($newDocs.Count)" -ForegroundColor Green
-        Write-Host "  Updated documents: $($updatedDocs.Count)" -ForegroundColor Yellow
-        Write-Host "  Deleted documents: $($deletedIds.Count)" -ForegroundColor Red
-        Write-Host "  Unchanged: $($syncResult.UnchangedRecords)" -ForegroundColor Gray
+        Write-N2SMessage "  New documents: $($newDocs.Count)" -Level Success
+        Write-N2SMessage "  Updated documents: $($updatedDocs.Count)" -Level Step
+        Write-N2SMessage "  Deleted documents: $($deletedIds.Count)" -Level Info
+        Write-N2SMessage "  Unchanged: $($syncResult.UnchangedRecords)" -Level Detail
         
         # Step 5: Sync changes
-        Write-Host "`nStep 4: Syncing changes..." -ForegroundColor Yellow
+        Write-N2SMessage "`nStep 4: Syncing changes..." -Level Step
         
         $newSyncState = @{
             LastSyncTime = $syncResult.SyncTime
@@ -3422,7 +3503,7 @@ function Start-IncrementalSync {
         
         # Insert new documents
         if ($newDocs.Count -gt 0) {
-            Write-Host "  Inserting $($newDocs.Count) new records..." -ForegroundColor Green
+            Write-N2SMessage "  Inserting $($newDocs.Count) new records..." -Level Success
             
             foreach ($item in $newDocs) {
                 try {
@@ -3451,12 +3532,12 @@ function Start-IncrementalSync {
                 }
             }
             
-            Write-Host "   Inserted $($syncResult.NewRecords) records" -ForegroundColor Green
+            Write-N2SMessage "   Inserted $($syncResult.NewRecords) records" -Level Success
         }
         
         # Update modified documents
         if ($updatedDocs.Count -gt 0) {
-            Write-Host "  Updating $($updatedDocs.Count) modified records..." -ForegroundColor Yellow
+            Write-N2SMessage "  Updating $($updatedDocs.Count) modified records..." -Level Step
             
             foreach ($item in $updatedDocs) {
                 try {
@@ -3486,12 +3567,12 @@ function Start-IncrementalSync {
                 }
             }
             
-            Write-Host "   Updated $($syncResult.UpdatedRecords) records" -ForegroundColor Yellow
+            Write-N2SMessage "   Updated $($syncResult.UpdatedRecords) records" -Level Step
         }
         
         # Delete removed documents
         if ($deletedIds.Count -gt 0) {
-            Write-Host "  Deleting $($deletedIds.Count) removed records..." -ForegroundColor Red
+            Write-N2SMessage "  Deleting $($deletedIds.Count) removed records..." -Level Step
             
             foreach ($id in $deletedIds) {
                 try {
@@ -3519,7 +3600,7 @@ function Start-IncrementalSync {
                 }
             }
             
-            Write-Host "   Deleted $($syncResult.DeletedRecords) records" -ForegroundColor Red
+            Write-N2SMessage "   Deleted $($syncResult.DeletedRecords) records" -Level Info
         }
         
         # Preserve hashes for unchanged documents
@@ -3543,50 +3624,50 @@ function Start-IncrementalSync {
         }
 
         # Display summary
-        Write-Host "`n═══════════════════════════════════════════════════════" -ForegroundColor Cyan
-        Write-Host "Sync Complete!" -ForegroundColor Green
-        Write-Host "═══════════════════════════════════════════════════════" -ForegroundColor Cyan
-        Write-Host "Sync Type: $(if ($syncResult.IsFullSync) { 'FULL' } else { 'INCREMENTAL' })" -ForegroundColor Gray
-        Write-Host "Total Processed: $($syncResult.TotalProcessed)" -ForegroundColor Gray
-        Write-Host "New Records: $($syncResult.NewRecords)" -ForegroundColor Green
-        Write-Host "Updated Records: $($syncResult.UpdatedRecords)" -ForegroundColor Yellow
-        Write-Host "Deleted Records: $($syncResult.DeletedRecords)" -ForegroundColor Red
-        Write-Host "Unchanged: $($syncResult.UnchangedRecords)" -ForegroundColor Gray
+        Write-N2SMessage "`n═══════════════════════════════════════════════════════" -Level Header
+        Write-N2SMessage "Sync Complete!" -Level Success
+        Write-N2SMessage "═══════════════════════════════════════════════════════" -Level Header
+        Write-N2SMessage "Sync Type: $(if ($syncResult.IsFullSync) { 'FULL' } else { 'INCREMENTAL' })" -Level Detail
+        Write-N2SMessage "Total Processed: $($syncResult.TotalProcessed)" -Level Detail
+        Write-N2SMessage "New Records: $($syncResult.NewRecords)" -Level Success
+        Write-N2SMessage "Updated Records: $($syncResult.UpdatedRecords)" -Level Step
+        Write-N2SMessage "Deleted Records: $($syncResult.DeletedRecords)" -Level Info
+        Write-N2SMessage "Unchanged: $($syncResult.UnchangedRecords)" -Level Detail
 
         if ($syncResult.RepairedChildRecords -gt 0) {
-            Write-Host "Repaired child rows for: $($syncResult.RepairedChildRecords) document(s)" -ForegroundColor Yellow
+            Write-N2SMessage "Repaired child rows for: $($syncResult.RepairedChildRecords) document(s)" -Level Step
         }
 
         if ($syncResult.ChildRecords.Count -gt 0) {
-            Write-Host "`nRows per child table:" -ForegroundColor Gray
+            Write-N2SMessage "`nRows per child table:" -Level Detail
             foreach ($childTable in ($syncResult.ChildRecords.Keys | Sort-Object)) {
-                Write-Host "  $childTable : $($syncResult.ChildRecords[$childTable])" -ForegroundColor Gray
+                Write-N2SMessage "  $childTable : $($syncResult.ChildRecords[$childTable])" -Level Detail
             }
-            Write-Host ""
+            Write-N2SMessage "" -Level Info
         }
 
-        Write-Host "Errors: $($syncResult.Errors.Count)" -ForegroundColor $(if ($syncResult.Errors.Count -gt 0) { 'Red' } else { 'Gray' })
+        Write-N2SMessage "Errors: $($syncResult.Errors.Count)" -Level $(if ($syncResult.Errors.Count -gt 0) { 'Error' } else { 'Detail' })
 
         if ($syncResult.Warnings.Count -gt 0) {
-            Write-Host "`nWarnings:" -ForegroundColor Yellow
+            Write-N2SMessage "`nWarnings:" -Level Step
             foreach ($warning in $syncResult.Warnings) {
-                Write-Host "  - $warning" -ForegroundColor Yellow
+                Write-N2SMessage "  - $warning" -Level Step
             }
         }
 
         if ($syncResult.Errors.Count -gt 0) {
-            Write-Host "`nErrors:" -ForegroundColor Red
+            Write-N2SMessage "`nErrors:" -Level Error
             foreach ($err in $syncResult.Errors) {
-                Write-Host "  - $err" -ForegroundColor Red
+                Write-N2SMessage "  - $err" -Level Error
             }
         }
         
-        Write-Host "═══════════════════════════════════════════════════════`n" -ForegroundColor Cyan
+        Write-N2SMessage "═══════════════════════════════════════════════════════`n" -Level Header
         
         return $syncResult
     }
     catch {
-        Write-Host "`n Sync failed: $($_.Exception.Message)" -ForegroundColor Red
+        Write-N2SMessage "`n Sync failed: $($_.Exception.Message)" -Level Error
         $syncResult.Errors += "Sync error: $($_.Exception.Message)"
         return $syncResult
     }
@@ -3624,7 +3705,7 @@ function Get-SyncState {
             return $state
         }
         catch {
-            Write-Host "Warning: Could not load sync state, performing full sync" -ForegroundColor Yellow
+            Write-N2SMessage "Warning: Could not load sync state, performing full sync" -Level Step
             return $null
         }
     }
@@ -3645,10 +3726,10 @@ function Save-SyncState {
     
     try {
         $SyncState | ConvertTo-Json -Depth 10 | Out-File -FilePath $FilePath -Encoding UTF8
-        Write-Host "`n Sync state saved to: $FilePath" -ForegroundColor Green
+        Write-N2SMessage "`n Sync state saved to: $FilePath" -Level Success
     }
     catch {
-        Write-Host "Warning: Could not save sync state: $($_.Exception.Message)" -ForegroundColor Yellow
+        Write-N2SMessage "Warning: Could not save sync state: $($_.Exception.Message)" -Level Step
     }
 }
 
@@ -3736,7 +3817,7 @@ function Get-DocumentHash {
         return $hash
     }
     catch {
-        Write-Host "Warning: Could not calculate hash for document" -ForegroundColor Yellow
+        Write-N2SMessage "Warning: Could not calculate hash for document" -Level Step
         return [guid]::NewGuid().ToString()
     }
 }
@@ -3777,7 +3858,7 @@ function Get-ChildTableMap {
         $reader.Close()
     }
     catch {
-        Write-Host "Warning: could not list child tables of $TableName : $($_.Exception.Message)" -ForegroundColor Yellow
+        Write-N2SMessage "Warning: could not list child tables of $TableName : $($_.Exception.Message)" -Level Step
         return $childTables
     }
 
@@ -3818,7 +3899,7 @@ function Get-ChildRowCounts {
         $reader.Close()
     }
     catch {
-        Write-Host "Warning: could not count rows of $ChildTable : $($_.Exception.Message)" -ForegroundColor Yellow
+        Write-N2SMessage "Warning: could not count rows of $ChildTable : $($_.Exception.Message)" -Level Step
     }
 
     return $counts
@@ -3969,7 +4050,7 @@ function Remove-DocumentChildRows {
             $cmd.ExecuteNonQuery() | Out-Null
         }
         catch {
-            Write-Host "Warning: could not delete child rows in $childTable : $($_.Exception.Message)" -ForegroundColor Yellow
+            Write-N2SMessage "Warning: could not delete child rows in $childTable : $($_.Exception.Message)" -Level Step
         }
     }
 }
@@ -4032,7 +4113,7 @@ function Update-SQLSchema {
         
         # Add missing columns
         if ($missingColumns.Count -gt 0) {
-            Write-Host "  Found $($missingColumns.Count) new field(s): $($missingColumns.Name -join ', ')" -ForegroundColor Yellow
+            Write-N2SMessage "  Found $($missingColumns.Count) new field(s): $($missingColumns.Name -join ', ')" -Level Step
             
             foreach ($column in $missingColumns) {
                 $dataType = Get-SQLDataType -Value $column.SampleValue -DatabaseType $DatabaseType
@@ -4044,7 +4125,7 @@ function Update-SQLSchema {
                 $cmd.CommandText = $alterSQL
                 $cmd.ExecuteNonQuery() | Out-Null
                 
-                Write-Host "   Added column: $($column.Name) ($dataType NULL)" -ForegroundColor Green
+                Write-N2SMessage "   Added column: $($column.Name) ($dataType NULL)" -Level Success
             }
             
             return $true
@@ -4053,7 +4134,7 @@ function Update-SQLSchema {
         return $false
     }
     catch {
-        Write-Host "Warning: Could not update schema: $($_.Exception.Message)" -ForegroundColor Yellow
+        Write-N2SMessage "Warning: Could not update schema: $($_.Exception.Message)" -Level Step
         return $false
     }
 }
@@ -4122,7 +4203,7 @@ function Get-AllSQLRecords {
         $reader.Close()
     }
     catch {
-        Write-Host "Error loading SQL records: $($_.Exception.Message)" -ForegroundColor Red
+        Write-N2SMessage "Error loading SQL records: $($_.Exception.Message)" -Level Error
     }
     
     return $records
@@ -4201,7 +4282,7 @@ function Invoke-InsertDocument {
         return $true
     }
     catch {
-        Write-Host "Insert error: $($_.Exception.Message)" -ForegroundColor Red
+        Write-N2SMessage "Insert error: $($_.Exception.Message)" -Level Error
         return $false
     }
 }
@@ -4276,7 +4357,7 @@ function Invoke-UpdateDocument {
         return $true
     }
     catch {
-        Write-Host "Update error: $($_.Exception.Message)" -ForegroundColor Red
+        Write-N2SMessage "Update error: $($_.Exception.Message)" -Level Error
         return $false
     }
 }
@@ -4306,7 +4387,7 @@ function Invoke-DeleteDocument {
         return $true
     }
     catch {
-        Write-Host "Delete error: $($_.Exception.Message)" -ForegroundColor Red
+        Write-N2SMessage "Delete error: $($_.Exception.Message)" -Level Error
         return $false
     }
 }
@@ -4355,12 +4436,12 @@ function Export-SyncReport {
         }
         
         $report | Out-File -FilePath $OutputPath -Encoding UTF8
-        Write-Host "Sync report exported to: $OutputPath" -ForegroundColor Green
+        Write-N2SMessage "Sync report exported to: $OutputPath" -Level Success
         
         return $true
     }
     catch {
-        Write-Host "Error exporting report: $($_.Exception.Message)" -ForegroundColor Red
+        Write-N2SMessage "Error exporting report: $($_.Exception.Message)" -Level Error
         return $false
     }
 }
@@ -4383,9 +4464,9 @@ function Invoke-ScheduledSync {
         [switch]$ForceFullSync
     )
     
-    Write-Host "`n" + ("="*60) -ForegroundColor Cyan
-    Write-Host "  Scheduled Sync - $TableName" -ForegroundColor Cyan
-    Write-Host ("="*60) + "`n" -ForegroundColor Cyan
+    Write-N2SMessage "`n$('=' * 60)" -Level Header
+    Write-N2SMessage "  Scheduled Sync - $TableName" -Level Header
+    Write-N2SMessage "$('=' * 60)`n" -Level Header
     
     # Run sync
     $syncResult = Start-IncrementalSync -TableName $TableName `
@@ -4396,8 +4477,8 @@ function Invoke-ScheduledSync {
     $reportFile = ".\sync_report_$(Get-Date -Format 'yyyyMMdd_HHmmss').txt"
     Export-SyncReport -SyncResult $syncResult -OutputPath $reportFile
     
-    Write-Host "`n Scheduled sync complete!" -ForegroundColor Green
-    Write-Host "  Report: $reportFile" -ForegroundColor Gray
+    Write-N2SMessage "`n Scheduled sync complete!" -Level Success
+    Write-N2SMessage "  Report: $reportFile" -Level Detail
     
     return $syncResult
 }
@@ -4492,6 +4573,10 @@ function Invoke-N2SMigration {
             $script:N2SConfigPath = $ConfigPath
         }
 
+        # Report through the PowerShell streams instead of straight to the
+        # screen, so this run can be silenced, logged or filtered by severity
+        Set-N2SOutputMode -Mode Stream
+
         if ($Quiet) {
             $InformationPreference = 'SilentlyContinue'
         }
@@ -4517,6 +4602,10 @@ function Invoke-N2SMigration {
         Write-Error "Migration run failed: $($_.Exception.Message)"
         $result.Error = $_.Exception.Message
         return $result
+    }
+    finally {
+        # The menu expects coloured output on screen again
+        Set-N2SOutputMode -Mode Console
     }
 }
 
@@ -4668,41 +4757,41 @@ function Invoke-MigrationWorkflow {
         [switch]$Force
     )
 
-    Write-Host "`n" + ("="*70) -ForegroundColor Cyan
-    Write-Host "  NoSQL to SQL Migration Tool - Multi-Collection Workflow" -ForegroundColor Cyan
-    Write-Host ("="*70) + "`n" -ForegroundColor Cyan
+    Write-N2SMessage "`n$('=' * 70)" -Level Header
+    Write-N2SMessage "  NoSQL to SQL Migration Tool - Multi-Collection Workflow" -Level Header
+    Write-N2SMessage "$('=' * 70)`n" -Level Header
     
     # Load configuration
     $script:AppConfig = Get-AppConfig
     
     # Get collections to process
     if ($Collections.Count -eq 0) {
-        Write-Host "Discovering collections..." -ForegroundColor Yellow
+        Write-N2SMessage "Discovering collections..." -Level Step
         $discoveredCollections = @(Get-MongoDBCollections)
         
         if ($discoveredCollections.Count -eq 0) {
-            Write-Host "No collections found in database." -ForegroundColor Red
+            Write-N2SMessage "No collections found in database." -Level Error
             return
         }
         
-        Write-Host "Found $($discoveredCollections.Count) collection(s): $($discoveredCollections -join ', ')" -ForegroundColor Green
+        Write-N2SMessage "Found $($discoveredCollections.Count) collection(s): $($discoveredCollections -join ', ')" -Level Success
 
         # Ask for confirmation, unless the caller already decided. Without -Force
         # this prompt blocks a scheduled task, which has no keyboard to answer it.
         $response = if ($Force) { 'Y' } else { Read-Host "`nProcess ALL collections? (Y/N)" }
 
         if ($response -ne 'Y' -and $response -ne 'y') {
-            Write-Host "Operation cancelled." -ForegroundColor Yellow
+            Write-N2SMessage "Operation cancelled." -Level Step
             return
         }
         
         $Collections = $discoveredCollections
     }
     
-    Write-Host "`nOperation: $Operation" -ForegroundColor Cyan
-    Write-Host "Collections: $($Collections -join ', ')" -ForegroundColor Cyan
-    Write-Host "Database Type: $DatabaseType" -ForegroundColor Cyan
-    Write-Host ""
+    Write-N2SMessage "`nOperation: $Operation" -Level Header
+    Write-N2SMessage "Collections: $($Collections -join ', ')" -Level Header
+    Write-N2SMessage "Database Type: $DatabaseType" -Level Header
+    Write-N2SMessage "" -Level Info
     
     # Overall results
     $overallResults = @{
@@ -4719,9 +4808,9 @@ function Invoke-MigrationWorkflow {
     
     # Process each collection
     foreach ($collectionName in $Collections) {
-        Write-Host "`n" + ("─"*70) -ForegroundColor Gray
-        Write-Host "Processing Collection: $collectionName" -ForegroundColor Yellow
-        Write-Host ("─"*70) -ForegroundColor Gray
+        Write-N2SMessage "`n$('─' * 70)" -Level Detail
+        Write-N2SMessage "Processing Collection: $collectionName" -Level Step
+        Write-N2SMessage ("─"*70) -Level Detail
         
         $collectionResult = @{
             Name = $collectionName
@@ -4770,21 +4859,21 @@ function Invoke-MigrationWorkflow {
 
                 if ($collectionResult.Warning) {
                     $overallResults.TotalWarnings++
-                    Write-Host " $collectionName completed with warnings: $($collectionResult.Warning)" -ForegroundColor Yellow
+                    Write-N2SMessage " $collectionName completed with warnings: $($collectionResult.Warning)" -Level Step
                 }
                 else {
-                    Write-Host " $collectionName completed successfully" -ForegroundColor Green
+                    Write-N2SMessage " $collectionName completed successfully" -Level Success
                 }
             }
             else {
                 $overallResults.TotalFailed++
-                Write-Host " $collectionName completed with errors: $($collectionResult.Error)" -ForegroundColor Red
+                Write-N2SMessage " $collectionName completed with errors: $($collectionResult.Error)" -Level Error
             }
         }
         catch {
             $collectionResult.Error = $_.Exception.Message
             $overallResults.TotalFailed++
-            Write-Host " $collectionName failed: $($_.Exception.Message)" -ForegroundColor Red
+            Write-N2SMessage " $collectionName failed: $($_.Exception.Message)" -Level Error
         }
         
         $overallResults.Collections += $collectionResult
@@ -4794,41 +4883,41 @@ function Invoke-MigrationWorkflow {
     $overallResults.EndTime = Get-Date
     $duration = $overallResults.EndTime - $overallResults.StartTime
     
-    Write-Host "`n" + ("="*70) -ForegroundColor Cyan
-    Write-Host "Overall Summary" -ForegroundColor Cyan
-    Write-Host ("="*70) -ForegroundColor Cyan
-    Write-Host "Duration: $($duration.TotalSeconds) seconds" -ForegroundColor Gray
-    Write-Host "Collections Processed: $($Collections.Count)" -ForegroundColor Gray
+    Write-N2SMessage "`n$('=' * 70)" -Level Header
+    Write-N2SMessage "Overall Summary" -Level Header
+    Write-N2SMessage ("="*70) -Level Header
+    Write-N2SMessage "Duration: $($duration.TotalSeconds) seconds" -Level Detail
+    Write-N2SMessage "Collections Processed: $($Collections.Count)" -Level Detail
     # An automated caller should be able to act on this without reading output
     if ($overallResults.TotalFailed -gt 0) {
         $overallResults.ExitCode = 1
     }
 
-    Write-Host "Successful: $($overallResults.TotalSuccess)" -ForegroundColor Green
-    Write-Host "With warnings: $($overallResults.TotalWarnings)" -ForegroundColor $(if ($overallResults.TotalWarnings -gt 0) { 'Yellow' } else { 'Gray' })
-    Write-Host "Failed: $($overallResults.TotalFailed)" -ForegroundColor $(if ($overallResults.TotalFailed -gt 0) { 'Red' } else { 'Gray' })
-    Write-Host "Exit code: $($overallResults.ExitCode)" -ForegroundColor $(if ($overallResults.ExitCode -ne 0) { 'Red' } else { 'Gray' })
+    Write-N2SMessage "Successful: $($overallResults.TotalSuccess)" -Level Success
+    Write-N2SMessage "With warnings: $($overallResults.TotalWarnings)" -Level $(if ($overallResults.TotalWarnings -gt 0) { 'Warning' } else { 'Detail' })
+    Write-N2SMessage "Failed: $($overallResults.TotalFailed)" -Level $(if ($overallResults.TotalFailed -gt 0) { 'Error' } else { 'Detail' })
+    Write-N2SMessage "Exit code: $($overallResults.ExitCode)" -Level $(if ($overallResults.ExitCode -ne 0) { 'Error' } else { 'Detail' })
 
-    Write-Host "`nCollection Results:" -ForegroundColor Yellow
+    Write-N2SMessage "`nCollection Results:" -Level Step
     foreach ($result in $overallResults.Collections) {
-        $color = if (-not $result.Success) { "Red" } elseif ($result.Warning) { "Yellow" } else { "Green" }
-        Write-Host "  $($result.Name)" -ForegroundColor $color
+        $level = if (-not $result.Success) { 'Error' } elseif ($result.Warning) { 'Warning' } else { 'Success' }
+        Write-N2SMessage "  $($result.Name)" -Level $level
 
         if ($result.Error) {
-            Write-Host "    Error: $($result.Error)" -ForegroundColor Red
+            Write-N2SMessage "    Error: $($result.Error)" -Level Error
         }
 
         if ($result.Warning) {
-            Write-Host "    Warning: $($result.Warning)" -ForegroundColor Yellow
+            Write-N2SMessage "    Warning: $($result.Warning)" -Level Step
         }
     }
 
-    Write-Host ("="*70) + "`n" -ForegroundColor Cyan
+    Write-N2SMessage "$('=' * 70)`n" -Level Header
     
     # Export overall report
     $reportFile = ".\workflow_report_$(Get-Date -Format 'yyyyMMdd_HHmmss').json"
     $overallResults | ConvertTo-Json -Depth 10 | Out-File -FilePath $reportFile -Encoding UTF8
-    Write-Host "Workflow report exported to: $reportFile`n" -ForegroundColor Green
+    Write-N2SMessage "Workflow report exported to: $reportFile`n" -Level Success
     
     return $overallResults
 }
@@ -4853,19 +4942,19 @@ function Get-MongoDBCollections {
         foreach ($col in $result.cursor.firstBatch) {
             $name = $col.name
             if ($name -and $name -notlike "system.*") {
-                Write-Host "  Found collection: $name" -ForegroundColor Gray
+                Write-N2SMessage "  Found collection: $name" -Level Detail
                 $collectionNames += $name
             }
         }
 
         if ($collectionNames.Count -eq 0) {
-            Write-Host "  Warning: No collections found in database $($script:AppConfig.MongoDB.Database)" -ForegroundColor Yellow
+            Write-N2SMessage "  Warning: No collections found in database $($script:AppConfig.MongoDB.Database)" -Level Step
         }
 
         return $collectionNames
     }
     catch {
-        Write-Host "Error retrieving collections: $($_.Exception.Message)" -ForegroundColor Red
+        Write-N2SMessage "Error retrieving collections: $($_.Exception.Message)" -Level Error
         return @()
     }
 }
@@ -4894,14 +4983,14 @@ function Invoke-FullMigration {
     
     try {
         # Step 1: Analyze schema
-        Write-Host "\n[1/4] Analyzing MongoDB schema..." -ForegroundColor Cyan
+        Write-N2SMessage "`n[1/4] Analyzing MongoDB schema..." -Level Header
         $result.Schema = Get-MongoDBSchema -ConnectionString $script:AppConfig.MongoDB.ConnectionString `
                                           -DatabaseName $script:AppConfig.MongoDB.Database `
                                           -CollectionName $CollectionName `
                                           -SampleSize $SampleSize
         
         # Step 2: Generate SQL schema
-        Write-Host "`n[2/4] Generating SQL schema..." -ForegroundColor Cyan
+        Write-N2SMessage "`n[2/4] Generating SQL schema..." -Level Header
         $result.SQLSchema = New-SQLSchema -Schema $result.Schema `
                                          -TableName $CollectionName `
                                          -PrimaryKeyField "_id"
@@ -4910,7 +4999,7 @@ function Invoke-FullMigration {
                         -OutputPath ".\schema_$CollectionName.sql" | Out-Null
         
         # Step 3: Migrate data
-        Write-Host "`n[3/4] Migrating data..." -ForegroundColor Cyan
+        Write-N2SMessage "`n[3/4] Migrating data..." -Level Header
         $result.Migration = Start-DataMigration -Schema $result.Schema `
                                                -SQLSchema $result.SQLSchema `
                                                -CollectionName $CollectionName `
@@ -4918,7 +5007,7 @@ function Invoke-FullMigration {
                                                -DatabaseType $DatabaseType
         
         # Step 4: Validate
-        Write-Host "`n[4/4] Validating migration..." -ForegroundColor Cyan
+        Write-N2SMessage "`n[4/4] Validating migration..." -Level Header
         $result.Validation = Test-MigrationValidation -TableName $CollectionName `
                                                       -SampleSize 10 `
                                                       -DatabaseType $DatabaseType
@@ -4926,7 +5015,7 @@ function Invoke-FullMigration {
         return $result
     }
     catch {
-        Write-Host "Error in full migration: $($_.Exception.Message)" -ForegroundColor Red
+        Write-N2SMessage "Error in full migration: $($_.Exception.Message)" -Level Error
         throw
     }
 }
@@ -4962,7 +5051,7 @@ function Invoke-IncrementalMigration {
         }
         
         if (-not $tableExists) {
-            Write-Host "Table doesn't exist, performing full migration..." -ForegroundColor Yellow
+            Write-N2SMessage "Table doesn't exist, performing full migration..." -Level Step
             return Invoke-FullMigration -CollectionName $CollectionName `
                                        -DatabaseType $DatabaseType `
                                        -SampleSize $SampleSize
@@ -4977,7 +5066,7 @@ function Invoke-IncrementalMigration {
         }
     }
     catch {
-        Write-Host "Error in incremental migration: $($_.Exception.Message)" -ForegroundColor Red
+        Write-N2SMessage "Error in incremental migration: $($_.Exception.Message)" -Level Error
         throw
     }
 }
@@ -5010,7 +5099,7 @@ function Invoke-ValidationOnly {
         }
     }
     catch {
-        Write-Host "Error in validation: $($_.Exception.Message)" -ForegroundColor Red
+        Write-N2SMessage "Error in validation: $($_.Exception.Message)" -Level Error
         throw
     }
 }
@@ -5045,7 +5134,7 @@ function Invoke-SchemaOnly {
         }
     }
     catch {
-        Write-Host "Error in schema analysis: $($_.Exception.Message)" -ForegroundColor Red
+        Write-N2SMessage "Error in schema analysis: $($_.Exception.Message)" -Level Error
         throw
     }
 }
@@ -5201,7 +5290,7 @@ function Show-MainMenu {
 }
 
 function Menu-TestConnections {
-    Write-Host "`n" + ("="*60) -ForegroundColor Cyan
+    Write-Host "`n$('=' * 60)" -ForegroundColor Cyan
     Write-Host "Testing Database Connections" -ForegroundColor Cyan
     Write-Host ("="*60) -ForegroundColor Cyan
     
@@ -5216,7 +5305,7 @@ function Menu-TestConnections {
 }
 
 function Menu-DiscoverCollections {
-    Write-Host "`n" + ("="*60) -ForegroundColor Cyan
+    Write-Host "`n$('=' * 60)" -ForegroundColor Cyan
     Write-Host "Discovering MongoDB Collections" -ForegroundColor Cyan
     Write-Host ("="*60) -ForegroundColor Cyan
     
@@ -5251,7 +5340,7 @@ function Menu-DiscoverCollections {
 }
 
 function Menu-MigrateSingle {
-    Write-Host "`n" + ("="*60) -ForegroundColor Cyan
+    Write-Host "`n$('=' * 60)" -ForegroundColor Cyan
     Write-Host "Migrate Single Collection" -ForegroundColor Cyan
     Write-Host ("="*60) -ForegroundColor Cyan
     
@@ -5291,7 +5380,7 @@ function Menu-MigrateSingle {
 }
 
 function Menu-MigrateMultiple {
-    Write-Host "`n" + ("="*60) -ForegroundColor Cyan
+    Write-Host "`n$('=' * 60)" -ForegroundColor Cyan
     Write-Host "Migrate Multiple Collections" -ForegroundColor Cyan
     Write-Host ("="*60) -ForegroundColor Cyan
     
@@ -5340,7 +5429,7 @@ function Menu-MigrateMultiple {
 }
 
 function Menu-MigrateAll {
-    Write-Host "`n" + ("="*60) -ForegroundColor Cyan
+    Write-Host "`n$('=' * 60)" -ForegroundColor Cyan
     Write-Host "Migrate ALL Collections" -ForegroundColor Cyan
     Write-Host ("="*60) -ForegroundColor Cyan
     
@@ -5368,7 +5457,7 @@ function Menu-MigrateAll {
 }
 
 function Menu-SyncSingle {
-    Write-Host "`n" + ("="*60) -ForegroundColor Cyan
+    Write-Host "`n$('=' * 60)" -ForegroundColor Cyan
     Write-Host "Sync Single Collection (Incremental)" -ForegroundColor Cyan
     Write-Host ("="*60) -ForegroundColor Cyan
     
@@ -5402,7 +5491,7 @@ function Menu-SyncSingle {
 }
 
 function Menu-SyncAll {
-    Write-Host "`n" + ("="*60) -ForegroundColor Cyan
+    Write-Host "`n$('=' * 60)" -ForegroundColor Cyan
     Write-Host "Sync ALL Collections" -ForegroundColor Cyan
     Write-Host ("="*60) -ForegroundColor Cyan
     
@@ -5430,7 +5519,7 @@ function Menu-SyncAll {
 }
 
 function Menu-ValidateSingle {
-    Write-Host "`n" + ("="*60) -ForegroundColor Cyan
+    Write-Host "`n$('=' * 60)" -ForegroundColor Cyan
     Write-Host "Validate Single Collection" -ForegroundColor Cyan
     Write-Host ("="*60) -ForegroundColor Cyan
     
@@ -5468,7 +5557,7 @@ function Menu-ValidateSingle {
 }
 
 function Menu-SchemaOnly {
-    Write-Host "`n" + ("="*60) -ForegroundColor Cyan
+    Write-Host "`n$('=' * 60)" -ForegroundColor Cyan
     Write-Host "Analyze Schema Only" -ForegroundColor Cyan
     Write-Host ("="*60) -ForegroundColor Cyan
     

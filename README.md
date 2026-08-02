@@ -114,3 +114,6 @@ https://www.youtube.com/watch?v=iWbemnUpGx4<br />
 __Extra__<br />
 https://learn.microsoft.com/en-us/powershell/<br />
 https://learn.microsoft.com/en-us/powershell/scripting/developer/module/how-to-write-a-powershell-module-manifest?view=powershell-7.5<br />
+
+__Output Streams:__ <br />
+https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_output_streams?view=powershell-7.6
