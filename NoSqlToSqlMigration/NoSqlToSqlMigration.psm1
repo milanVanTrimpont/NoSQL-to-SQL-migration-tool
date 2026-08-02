@@ -70,9 +70,9 @@ function Get-MongoDBSchema {
             $docCount++
             Write-Progress -Activity "Analyzing documents" -Status "Document $docCount of $actualSampleSize" -PercentComplete (($docCount / $actualSampleSize) * 100)
             
-            # Debug: Check document type
-            Write-Host "DEBUG: Document type: $($doc.GetType().FullName)" -ForegroundColor DarkGray
-            
+            # Only of interest while debugging, so not on the normal output
+            Write-Verbose "Document type: $($doc.GetType().FullName)"
+
             # Convert to proper object if needed
             if ($doc -is [MongoDB.Bson.BsonDocument]) {
                 $doc = [MongoDB.Bson.BsonTypeMapper]::MapToDotNetValue($doc)
@@ -797,6 +797,7 @@ To ensure that all database connections are correctly configured and operational
         StartTime = Get-Date
         TablesCreated = @()
         RecordsInserted = @{}
+        ConversionIssues = @()
     }
     
     try {
@@ -820,6 +821,12 @@ To ensure that all database connections are correctly configured and operational
         $sqlConnection.Open()
         Write-Host " $DatabaseType connected" -ForegroundColor Green
         
+        # How to handle values that do not fit their column: Warn (default),
+        # Skip or Fail. Read once, because this is checked per document.
+        $script:N2SConversionPolicy = Get-ConversionErrorPolicy -Config $config
+        $script:N2SConversionIssues = @()
+        Write-Host " Conversion errors: $($script:N2SConversionPolicy)" -ForegroundColor Gray
+
         # Step 2: Create tables
         Write-Host "`nStep 2: Creating tables..." -ForegroundColor Yellow
 
@@ -940,6 +947,30 @@ To ensure that all database connections are correctly configured and operational
         foreach ($table in $migrationResult.RecordsInserted.Keys | Sort-Object) {
             Write-Host "  $table : $($migrationResult.RecordsInserted[$table])" -ForegroundColor Gray
         }
+
+        # Values that did not fit their column, so nothing disappears unnoticed
+        $migrationResult.ConversionIssues = @($script:N2SConversionIssues)
+
+        if ($migrationResult.ConversionIssues.Count -gt 0) {
+            $affectedDocuments = @($migrationResult.ConversionIssues | Select-Object -ExpandProperty Document -Unique).Count
+
+            Write-Host "`nConversion problems: $($migrationResult.ConversionIssues.Count) value(s) in $affectedDocuments document(s)" -ForegroundColor Yellow
+
+            foreach ($issue in ($migrationResult.ConversionIssues | Select-Object -First 5)) {
+                Write-Host "  $($issue.Table).$($issue.Field): $($issue.Reason) -> $($issue.Action)" -ForegroundColor Yellow
+            }
+
+            if ($migrationResult.ConversionIssues.Count -gt 5) {
+                Write-Host "  ... and $($migrationResult.ConversionIssues.Count - 5) more" -ForegroundColor Yellow
+            }
+
+            $reportPath = ".\conversion_report_$($SQLSchema.MainTable)_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
+            $written = Export-ConversionReport -Issues $migrationResult.ConversionIssues -OutputPath $reportPath
+
+            if ($written) {
+                Write-Host "  Full report: $written" -ForegroundColor Gray
+            }
+        }
         
         if ($migrationResult.Errors.Count -gt 0) {
             Write-Host "`nErrors encountered:" -ForegroundColor Red
@@ -1055,6 +1086,8 @@ function Get-SQLTableColumns {
         return $script:N2STableColumns[$TableName]
     }
 
+    # Values are the column types (for example 'varchar(255)', 'datetime'), so the
+    # conversion layer knows what a value has to fit into
     $columns = @{}
 
     try {
@@ -1063,7 +1096,7 @@ function Get-SQLTableColumns {
         $reader = $cmd.ExecuteReader()
 
         while ($reader.Read()) {
-            $columns[$reader.GetString(0)] = $true
+            $columns[$reader.GetString(0)] = $reader.GetString(1)
         }
         $reader.Close()
 
@@ -1074,6 +1107,236 @@ function Get-SQLTableColumns {
     }
 
     return $columns
+}
+
+function ConvertTo-SQLDateTime {
+    <#
+    .SYNOPSIS
+    Parses a value into a DateTime, accepting the formats that occur in practice
+
+    .DESCRIPTION
+    A date can arrive as a real DateTime or as text in any notation. Day-first
+    is tried before month-first, because month-day is mainly used in the US and is less common
+    #>
+
+    param (
+        $Value
+    )
+
+    if ($Value -is [DateTime]) {
+        return $Value
+    }
+
+    if ($null -eq $Value) {
+        return $null
+    }
+
+    $text = $Value.ToString().Trim()
+    if ($text -eq '') {
+        return $null
+    }
+
+    $formats = @(
+        'yyyy-MM-ddTHH:mm:ss.fffffffK', 'yyyy-MM-ddTHH:mm:ssK', 'yyyy-MM-ddTHH:mm:ss',
+        'yyyy-MM-dd HH:mm:ss', 'yyyy-MM-dd', 'yyyy/MM/dd',
+        'dd/MM/yyyy HH:mm:ss', 'dd/MM/yyyy', 'dd-MM-yyyy', 'dd.MM.yyyy',
+        'MM/dd/yyyy HH:mm:ss', 'MM/dd/yyyy'
+    )
+
+    $styles = [System.Globalization.DateTimeStyles]::AllowWhiteSpaces
+    $parsed = [DateTime]::MinValue
+
+    if ([DateTime]::TryParseExact($text, $formats, [System.Globalization.CultureInfo]::InvariantCulture, $styles, [ref]$parsed)) {
+        return $parsed
+    }
+
+    if ([DateTime]::TryParse($text, [System.Globalization.CultureInfo]::InvariantCulture, $styles, [ref]$parsed)) {
+        return $parsed
+    }
+
+    if ([DateTime]::TryParse($text, [System.Globalization.CultureInfo]::CurrentCulture, $styles, [ref]$parsed)) {
+        return $parsed
+    }
+
+    return $null
+}
+
+function ConvertTo-SQLTextValue {
+    <#
+    .SYNOPSIS
+    Writes a value into a text column in a culture independent notation
+
+    .DESCRIPTION
+    A date lands in a text column whenever the field holds mixed types. Using
+    ToString() would write it in the notation of the machine running the
+    migration, so the same data would look different on another machine and
+    would not sort correctly. Dates become ISO, numbers use a decimal point.
+    #>
+
+    param (
+        $Value
+    )
+
+    if ($Value -is [DateTime]) {
+        return $Value.ToString('yyyy-MM-dd HH:mm:ss', [System.Globalization.CultureInfo]::InvariantCulture)
+    }
+
+    if ($Value -is [double] -or $Value -is [float] -or $Value -is [decimal]) {
+        return ([double]$Value).ToString([System.Globalization.CultureInfo]::InvariantCulture)
+    }
+
+    return $Value.ToString()
+}
+
+function ConvertTo-SQLColumnValue {
+    <#
+    .SYNOPSIS
+    Converts one document value to the type of the column it goes into
+
+    .DESCRIPTION
+    Returns a result with Success, Value and Reason instead of throwing. A value
+    that does not fit must never take down the document it belongs to, let alone
+    the whole migration: the caller decides what happens with it.
+    #>
+
+    param (
+        $Value,
+        [string]$ColumnType,
+        [string]$DatabaseType = "MySQL"
+    )
+
+    $result = @{
+        Success = $true
+        Value   = [DBNull]::Value
+        Reason  = $null
+    }
+
+    if ($null -eq $Value) {
+        return $result
+    }
+
+    # Normalize the MongoDB value first (ObjectId, BSON types, booleans)
+    $value = Convert-ToSQLValue -Value $Value -DatabaseType $DatabaseType
+
+    if ($value -is [DBNull]) {
+        return $result
+    }
+
+    # No column type known: keep the old behaviour
+    if ([string]::IsNullOrWhiteSpace($ColumnType)) {
+        $result.Value = $value
+        return $result
+    }
+
+    $baseType = ($ColumnType -replace '\(.*$', '').Trim().ToLowerInvariant()
+
+    switch -Regex ($baseType) {
+        '^(datetime|timestamp|date)$' {
+            $parsed = ConvertTo-SQLDateTime -Value $value
+
+            if ($null -eq $parsed) {
+                $result.Success = $false
+                $result.Reason = "'$value' is not a recognisable date for a $baseType column"
+                return $result
+            }
+
+            if ($baseType -eq 'date') {
+                $result.Value = $parsed.Date
+            }
+            else {
+                $result.Value = $parsed
+            }
+            return $result
+        }
+
+        '^(int|integer|bigint|smallint|mediumint|tinyint)$' {
+            $number = 0L
+
+            if ($value -is [bool]) {
+                $result.Value = [int]$value
+                return $result
+            }
+
+            if ([long]::TryParse($value.ToString().Trim(), [System.Globalization.NumberStyles]::Integer,
+                                 [System.Globalization.CultureInfo]::InvariantCulture, [ref]$number)) {
+                $result.Value = $number
+                return $result
+            }
+
+            $result.Success = $false
+            $result.Reason = "'$value' is not a whole number for a $baseType column"
+            return $result
+        }
+
+        '^(decimal|numeric|float|double|real)$' {
+            $number = 0.0
+            # A decimal comma is common in exported data, so try that too
+            $text = $value.ToString().Trim()
+
+            foreach ($candidate in @($text, ($text -replace ',', '.'))) {
+                if ([double]::TryParse($candidate, [System.Globalization.NumberStyles]::Float,
+                                       [System.Globalization.CultureInfo]::InvariantCulture, [ref]$number)) {
+                    $result.Value = $number
+                    return $result
+                }
+            }
+
+            $result.Success = $false
+            $result.Reason = "'$value' is not a number for a $baseType column"
+            return $result
+        }
+
+        '^(char|varchar|nvarchar)$' {
+            $text = ConvertTo-SQLTextValue -Value $value
+
+            # A value longer than the column would be rejected by the database
+            if ($ColumnType -match '\((\d+)\)') {
+                $maxLength = [int]$matches[1]
+
+                if ($text.Length -gt $maxLength) {
+                    $result.Success = $false
+                    $result.Reason = "value of $($text.Length) characters does not fit $ColumnType"
+                    return $result
+                }
+            }
+
+            $result.Value = $text
+            return $result
+        }
+
+        default {
+            # text, longtext, blob and anything else: store as text
+            $result.Value = ConvertTo-SQLTextValue -Value $value
+            return $result
+        }
+    }
+}
+
+function Add-ConversionIssue {
+    <#
+    .SYNOPSIS
+    Records a value that could not be converted, so nothing is lost silently
+    #>
+
+    param (
+        [string]$TableName,
+        [string]$DocumentId,
+        [string]$FieldName,
+        [string]$Reason,
+        [string]$Action
+    )
+
+    if ($null -eq $script:N2SConversionIssues) {
+        $script:N2SConversionIssues = @()
+    }
+
+    $script:N2SConversionIssues += [PSCustomObject]@{
+        Table    = $TableName
+        Document = $DocumentId
+        Field    = $FieldName
+        Reason   = $Reason
+        Action   = $Action
+    }
 }
 
 function ConvertTo-FlatRow {
@@ -1162,6 +1425,37 @@ function Add-SQLRow {
     $cmd.ExecuteNonQuery() | Out-Null
 }
 
+function Get-ConvertedChildValue {
+    <#
+    .SYNOPSIS
+    Converts one array element or sub-document value for its child column
+
+    .DESCRIPTION
+    A child row belongs to a parent document that did migrate, so an
+    unconvertible element is stored as NULL and recorded, never dropped silently.
+    #>
+
+    param (
+        $Value,
+        [string]$ColumnType,
+        [string]$ChildTable,
+        $ParentId,
+        [string]$FieldName,
+        [string]$DatabaseType
+    )
+
+    $converted = ConvertTo-SQLColumnValue -Value $Value -ColumnType $ColumnType -DatabaseType $DatabaseType
+
+    if ($converted.Success) {
+        return $converted.Value
+    }
+
+    Add-ConversionIssue -TableName $ChildTable -DocumentId "$ParentId" -FieldName $FieldName `
+                        -Reason $converted.Reason -Action 'stored as NULL'
+
+    return [DBNull]::Value
+}
+
 function Invoke-ChildTableMigration {
     <#
     .SYNOPSIS
@@ -1199,7 +1493,12 @@ function Invoke-ChildTableMigration {
 
         foreach ($entry in (ConvertTo-FlatRow -Object $Value).GetEnumerator()) {
             if ($childColumns.ContainsKey($entry.Key)) {
-                $row[$entry.Key] = Convert-ToSQLValue -Value $entry.Value -DatabaseType $DatabaseType
+                $row[$entry.Key] = Get-ConvertedChildValue -Value $entry.Value `
+                                                           -ColumnType $childColumns[$entry.Key] `
+                                                           -ChildTable $ChildTable `
+                                                           -ParentId $ParentId `
+                                                           -FieldName $entry.Key `
+                                                           -DatabaseType $DatabaseType
             }
         }
 
@@ -1221,12 +1520,22 @@ function Invoke-ChildTableMigration {
             if (Test-IsDocumentObject -Value $item) {
                 foreach ($entry in (ConvertTo-FlatRow -Object $item).GetEnumerator()) {
                     if ($childColumns.ContainsKey($entry.Key)) {
-                        $row[$entry.Key] = Convert-ToSQLValue -Value $entry.Value -DatabaseType $DatabaseType
+                        $row[$entry.Key] = Get-ConvertedChildValue -Value $entry.Value `
+                                                                   -ColumnType $childColumns[$entry.Key] `
+                                                                   -ChildTable $ChildTable `
+                                                                   -ParentId $ParentId `
+                                                                   -FieldName $entry.Key `
+                                                                   -DatabaseType $DatabaseType
                     }
                 }
             }
             elseif ($childColumns.ContainsKey('value')) {
-                $row['value'] = Convert-ToSQLValue -Value $item -DatabaseType $DatabaseType
+                $row['value'] = Get-ConvertedChildValue -Value $item `
+                                                        -ColumnType $childColumns['value'] `
+                                                        -ChildTable $ChildTable `
+                                                        -ParentId $ParentId `
+                                                        -FieldName 'value' `
+                                                        -DatabaseType $DatabaseType
             }
 
             Add-SQLRow -Connection $Connection -TableName $ChildTable -Row $row
@@ -1236,6 +1545,59 @@ function Invoke-ChildTableMigration {
     }
 
     return $rowsWritten
+}
+
+function Get-ConversionErrorPolicy {
+    <#
+    .SYNOPSIS
+    Reads what should happen with a value that does not fit its column
+
+    .DESCRIPTION
+    Warn  - store the field as NULL, keep the document, record the problem (default)
+    Skip  - do not migrate the document, record the problem
+    Fail  - stop the migration on the first unconvertible value
+    #>
+
+    param (
+        $Config
+    )
+
+    $policy = $null
+
+    if ($null -ne $Config -and $null -ne $Config.Migration) {
+        $policy = $Config.Migration.OnConversionError
+    }
+
+    if ($policy -in @('Warn', 'Skip', 'Fail')) {
+        return $policy
+    }
+
+    return 'Warn'
+}
+
+function Export-ConversionReport {
+    <#
+    .SYNOPSIS
+    Writes the recorded conversion problems to a CSV file
+    #>
+
+    param (
+        $Issues,
+        [string]$OutputPath
+    )
+
+    if ($null -eq $Issues -or @($Issues).Count -eq 0) {
+        return $null
+    }
+
+    try {
+        @($Issues) | Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8
+        return $OutputPath
+    }
+    catch {
+        Write-Host "Warning: could not write conversion report: $($_.Exception.Message)" -ForegroundColor Yellow
+        return $null
+    }
 }
 
 function Invoke-DocumentMigration {
@@ -1281,10 +1643,46 @@ function Invoke-DocumentMigration {
         # Write only fields that have a column in the table
         $tableColumns = Get-SQLTableColumns -Connection $Connection -TableName $TableName
 
+        $documentId = if ($null -ne $Document[$PrimaryKeyField]) { $Document[$PrimaryKeyField].ToString() } else { '<unknown>' }
+        $policy = $script:N2SConversionPolicy
+        if ([string]::IsNullOrWhiteSpace($policy)) { $policy = 'Warn' }
+
         $row = [ordered]@{}
         foreach ($field in $flatFields.Keys) {
-            if ($tableColumns.Count -eq 0 -or $tableColumns.ContainsKey($field)) {
-                $row[$field] = Convert-ToSQLValue -Value $flatFields[$field] -DatabaseType $DatabaseType
+            if ($tableColumns.Count -gt 0 -and -not $tableColumns.ContainsKey($field)) {
+                continue
+            }
+
+            $columnType = if ($tableColumns.Count -gt 0) { $tableColumns[$field] } else { '' }
+            $converted = ConvertTo-SQLColumnValue -Value $flatFields[$field] `
+                                                  -ColumnType $columnType `
+                                                  -DatabaseType $DatabaseType
+
+            if ($converted.Success) {
+                $row[$field] = $converted.Value
+                continue
+            }
+
+            # The value does not fit the column.
+            # see Migration.OnConversionError in the config.
+            switch ($policy) {
+                'Fail' {
+                    Add-ConversionIssue -TableName $TableName -DocumentId $documentId -FieldName $field `
+                                        -Reason $converted.Reason -Action 'migration stopped'
+                    throw "Conversion failed for field '$field' of document $documentId : $($converted.Reason)"
+                }
+                'Skip' {
+                    Add-ConversionIssue -TableName $TableName -DocumentId $documentId -FieldName $field `
+                                        -Reason $converted.Reason -Action 'document skipped'
+                    Write-Host "Skipped document $documentId : $($converted.Reason)" -ForegroundColor Yellow
+                    return $false
+                }
+                default {
+                    # Warn: keep the document, leave this one field empty
+                    Add-ConversionIssue -TableName $TableName -DocumentId $documentId -FieldName $field `
+                                        -Reason $converted.Reason -Action 'stored as NULL'
+                    $row[$field] = [DBNull]::Value
+                }
             }
         }
 
@@ -1735,6 +2133,12 @@ function New-TableDefinition {
 
     $columns = @()
 
+    # An empty collection would otherwise produce CREATE TABLE x () and fail.
+    # The key column is always there, so the table can be filled later.
+    if ($Fields.Keys.Count -eq 0) {
+        $columns += "    [$PrimaryKeyField] VARCHAR(24) PRIMARY KEY NOT NULL"
+    }
+
     foreach ($fieldName in ($Fields.Keys | Sort-Object)) {
         $fieldInfo = $Fields[$fieldName]
         $sqlType = Convert-MongoTypeToSQL -FieldInfo $fieldInfo -FieldName $fieldName
@@ -1937,14 +2341,33 @@ function Convert-MongoTypeToSQL {
         [string]$FieldName
     )
     
-    # Get the most common type for this field
-    $primaryType = ($FieldInfo.Types.GetEnumerator() | Sort-Object -Property Value -Descending | Select-Object -First 1).Key
-    
     # Special handling for _id field
     if ($FieldName -eq "_id") {
         return "VARCHAR(24)"
     }
-    
+
+    # Decide on ALL observed types, not on the most common one. MongoDB has no
+    # schema, so the same field can hold a real date in one document and a date
+    # written as text in the next. Picking the majority type gives a column that
+    # the minority values can never enter, and those documents are lost.
+    $observedTypes = @($FieldInfo.Types.Keys | Where-Object { $_ -ne 'null' })
+
+    if ($observedTypes.Count -eq 0) {
+        return "VARCHAR(255)"
+    }
+
+    if ($observedTypes.Count -eq 1) {
+        $primaryType = $observedTypes[0]
+    }
+    elseif (@($observedTypes | Where-Object { $_ -notin @('integer', 'number') }).Count -eq 0) {
+        # Only numbers, but integer and decimal mixed
+        $primaryType = 'number'
+    }
+    else {
+        # Mixed types, for example datetime and string: text can hold every value
+        $primaryType = 'string'
+    }
+
     # Map MongoDB types to SQL types
     switch ($primaryType) {
         "string" {
@@ -2425,7 +2848,18 @@ function Compare-DocumentToRecord {
             
             $mongoValue = $mongoFields[$fieldName]
             $sqlValue = $SQLRecord[$fieldName]
-            
+
+            # A date stored as text in MongoDB ends up as a real date in SQL.
+            # Compare the dates, not the notation, otherwise every converted
+            # value looks like a difference.
+            if ($sqlValue -is [DateTime] -and $mongoValue -isnot [DateTime]) {
+                $parsedMongoDate = ConvertTo-SQLDateTime -Value $mongoValue
+
+                if ($null -ne $parsedMongoDate) {
+                    $mongoValue = $parsedMongoDate
+                }
+            }
+
             # Normalize values for comparison
             $mongoNormalized = Normalize-ValueForComparison -Value $mongoValue -DatabaseType $DatabaseType
             $sqlNormalized = Normalize-ValueForComparison -Value $sqlValue -DatabaseType $DatabaseType
