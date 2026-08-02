@@ -4414,6 +4414,7 @@ function Get-CollectionResultStatus {
     $status = @{
         Success = $true
         Reason  = $null
+        Warning = $null
     }
 
     if ($null -eq $Details -or $Details -isnot [System.Collections.IDictionary]) {
@@ -4434,12 +4435,52 @@ function Get-CollectionResultStatus {
     # Full migration, also used when a sync falls back to one because the
     # table does not exist yet
     if ($Details.Contains('Migration') -and $null -ne $Details['Migration']) {
-        $failed = $Details['Migration'].FailedDocuments
+        $migration = $Details['Migration']
 
-        if ($failed -gt 0) {
+        if ($migration.FailedDocuments -gt 0) {
             $status.Success = $false
-            $status.Reason = "$failed of $($Details['Migration'].TotalDocuments) documents failed to migrate"
+            $status.Reason = "$($migration.FailedDocuments) of $($migration.TotalDocuments) documents failed to migrate"
             return $status
+        }
+
+        # Values that did not fit their column were handled on purpose
+        # (see Migration.OnConversionError), so this is a warning, not a failure
+        $conversionIssues = @($migration.ConversionIssues)
+
+        if ($conversionIssues.Count -gt 0) {
+            $status.Warning = "$($conversionIssues.Count) value(s) could not be converted; see the conversion report"
+        }
+    }
+
+    # Validation, from a full migration as well as from a validation-only run
+    if ($Details.Contains('Validation') -and $null -ne $Details['Validation']) {
+        $validation = $Details['Validation']
+        $issueCount = @($validation.Issues).Count
+
+        if ($validation.OverallStatus -in @('FAILED', 'ERROR')) {
+            $status.Success = $false
+            $status.Reason = "validation $($validation.OverallStatus) with $issueCount issue(s)"
+            return $status
+        }
+
+        # Fewer rows in SQL than documents in MongoDB means data is missing,
+        # whatever the sample check says about the rest
+        if ($validation.RecordCountMatch -eq $false) {
+            $status.Success = $false
+            $status.Reason = "record counts do not match: MongoDB=$($validation.MongoCount), SQL=$($validation.SQLCount)"
+            return $status
+        }
+
+        if ($validation.OverallStatus -eq 'PARTIAL') {
+            $partialWarning = "validation PARTIAL with $issueCount issue(s)"
+
+            # Keep an earlier warning about conversions: both matter
+            if ($status.Warning) {
+                $status.Warning = "$($status.Warning); $partialWarning"
+            }
+            else {
+                $status.Warning = $partialWarning
+            }
         }
     }
 
@@ -4541,6 +4582,10 @@ function Invoke-MigrationWorkflow {
         Collections = @()
         TotalSuccess = 0
         TotalFailed = 0
+        TotalWarnings = 0
+        # 0 = everything fine, 1 = one or more collections failed.
+        # A caller in an automated environment can use this as its exit code.
+        ExitCode = 0
     }
     
     # Process each collection
@@ -4553,47 +4598,54 @@ function Invoke-MigrationWorkflow {
             Name = $collectionName
             Success = $false
             Error = $null
+            Warning = $null
             Details = $null
         }
-        
+
         try {
             switch ($Operation) {
                 "FullMigration" {
                     $collectionResult.Details = Invoke-FullMigration -CollectionName $collectionName `
                                                                      -DatabaseType $DatabaseType `
                                                                      -SampleSize $SampleSize
-                    $collectionResult.Success = $true
                 }
-                
+
                 "IncrementalSync" {
                     $collectionResult.Details = Invoke-IncrementalMigration -CollectionName $collectionName `
                                                                             -DatabaseType $DatabaseType `
                                                                             -SampleSize $SampleSize
-
-                    # A sync that reported errors is not a success, even though
-                    # it did not throw
-                    $status = Get-CollectionResultStatus -Details $collectionResult.Details
-                    $collectionResult.Success = $status.Success
-                    $collectionResult.Error = $status.Reason
                 }
-                
+
                 "ValidationOnly" {
                     $collectionResult.Details = Invoke-ValidationOnly -CollectionName $collectionName `
                                                                       -DatabaseType $DatabaseType `
                                                                       -SampleSize $SampleSize
-                    $collectionResult.Success = $true
                 }
-                
+
                 "SchemaOnly" {
                     $collectionResult.Details = Invoke-SchemaOnly -CollectionName $collectionName `
                                                                   -SampleSize $SampleSize
-                    $collectionResult.Success = $true
                 }
             }
+
+            # Not throwing is not the same as succeeding: failed documents, a
+            # failed validation or a count mismatch all mean this collection
+            # did not finish correctly, whatever operation produced them.
+            $status = Get-CollectionResultStatus -Details $collectionResult.Details
+            $collectionResult.Success = $status.Success
+            $collectionResult.Error = $status.Reason
+            $collectionResult.Warning = $status.Warning
             
             if ($collectionResult.Success) {
                 $overallResults.TotalSuccess++
-                Write-Host " $collectionName completed successfully" -ForegroundColor Green
+
+                if ($collectionResult.Warning) {
+                    $overallResults.TotalWarnings++
+                    Write-Host " $collectionName completed with warnings: $($collectionResult.Warning)" -ForegroundColor Yellow
+                }
+                else {
+                    Write-Host " $collectionName completed successfully" -ForegroundColor Green
+                }
             }
             else {
                 $overallResults.TotalFailed++
@@ -4618,20 +4670,30 @@ function Invoke-MigrationWorkflow {
     Write-Host ("="*70) -ForegroundColor Cyan
     Write-Host "Duration: $($duration.TotalSeconds) seconds" -ForegroundColor Gray
     Write-Host "Collections Processed: $($Collections.Count)" -ForegroundColor Gray
+    # An automated caller should be able to act on this without reading output
+    if ($overallResults.TotalFailed -gt 0) {
+        $overallResults.ExitCode = 1
+    }
+
     Write-Host "Successful: $($overallResults.TotalSuccess)" -ForegroundColor Green
+    Write-Host "With warnings: $($overallResults.TotalWarnings)" -ForegroundColor $(if ($overallResults.TotalWarnings -gt 0) { 'Yellow' } else { 'Gray' })
     Write-Host "Failed: $($overallResults.TotalFailed)" -ForegroundColor $(if ($overallResults.TotalFailed -gt 0) { 'Red' } else { 'Gray' })
-    
+    Write-Host "Exit code: $($overallResults.ExitCode)" -ForegroundColor $(if ($overallResults.ExitCode -ne 0) { 'Red' } else { 'Gray' })
+
     Write-Host "`nCollection Results:" -ForegroundColor Yellow
     foreach ($result in $overallResults.Collections) {
-        $status = if ($result.Success) { "" } else { "" }
-        $color = if ($result.Success) { "Green" } else { "Red" }
-        Write-Host "  $status $($result.Name)" -ForegroundColor $color
-        
+        $color = if (-not $result.Success) { "Red" } elseif ($result.Warning) { "Yellow" } else { "Green" }
+        Write-Host "  $($result.Name)" -ForegroundColor $color
+
         if ($result.Error) {
             Write-Host "    Error: $($result.Error)" -ForegroundColor Red
         }
+
+        if ($result.Warning) {
+            Write-Host "    Warning: $($result.Warning)" -ForegroundColor Yellow
+        }
     }
-    
+
     Write-Host ("="*70) + "`n" -ForegroundColor Cyan
     
     # Export overall report
