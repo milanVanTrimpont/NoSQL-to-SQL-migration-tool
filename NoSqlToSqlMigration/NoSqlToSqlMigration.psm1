@@ -423,7 +423,14 @@ The path to the configuration file. Defaults to config.json in the script's dire
 #>
 function Get-AppConfig {
     param(
-        [string]$Path = "$PSScriptRoot\..\config.json"    )
+        [string]$Path
+    )
+
+    if (-not $Path) {
+        # A path set by Invoke-N2SMigration wins over the default next to the module,
+        # so an automated run can point at its own configuration file
+        $Path = if ($script:N2SConfigPath) { $script:N2SConfigPath } else { "$PSScriptRoot\..\config.json" }
+    }
 
     if (-not (Test-Path $Path)) {
         throw "Config file not found: $Path"
@@ -4396,6 +4403,123 @@ function Invoke-ScheduledSync {
 }
 
 
+function Invoke-N2SMigration {
+    <#
+    .SYNOPSIS
+    Non-interactive entry point for automated environments
+
+    .DESCRIPTION
+    Runs a migration, sync or validation without ever asking a question, and
+    returns the result object with an ExitCode. Meant for Task Scheduler, cron
+    or CI, where there is no keyboard to answer a prompt.
+
+    Everything is driven by parameters and the configuration file, and the
+    console output can be redirected or silenced by the caller.
+
+    .PARAMETER Collections
+    Collections to process. Empty means every collection in the database.
+
+    .PARAMETER Operation
+    FullMigration, IncrementalSync, ValidationOnly or SchemaOnly.
+
+    .PARAMETER DatabaseType
+    MySQL or SQLServer.
+
+    .PARAMETER SampleSize
+    Number of documents to analyse for the schema. Use a value at least as large
+    as the collection to be sure no field is missed.
+
+    .PARAMETER ConfigPath
+    Path to the configuration file. Defaults to config.json next to the module.
+
+    .PARAMETER Quiet
+    Suppress the progress output; warnings and errors are still reported.
+
+    .OUTPUTS
+    The workflow result, including ExitCode (0 = fine, 1 = a collection failed).
+
+    .EXAMPLE
+    # Scheduled sync of every collection, exit code for the scheduler
+    $result = Invoke-N2SMigration -Operation IncrementalSync
+    exit $result.ExitCode
+
+    .EXAMPLE
+    # Full migration of one collection, output to a log file
+    Invoke-N2SMigration -Collections users -Operation FullMigration 6>> .\migration.log
+    #>
+
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory=$false)]
+        [string[]]$Collections = @(),
+
+        [Parameter(Mandatory=$false)]
+        [ValidateSet("FullMigration", "IncrementalSync", "ValidationOnly", "SchemaOnly")]
+        [string]$Operation = "IncrementalSync",
+
+        [Parameter(Mandatory=$false)]
+        [ValidateSet("MySQL", "SQLServer")]
+        [string]$DatabaseType = "MySQL",
+
+        [Parameter(Mandatory=$false)]
+        [int]$SampleSize = 100,
+
+        [Parameter(Mandatory=$false)]
+        [string]$ConfigPath,
+
+        [Parameter(Mandatory=$false)]
+        [switch]$Quiet
+    )
+
+    # An unreachable database or a broken configuration should come out as a
+    # non-zero exit code, not as an unhandled exception in a scheduler log
+    $result = @{
+        Operation     = $Operation
+        TotalSuccess  = 0
+        TotalFailed   = 0
+        TotalWarnings = 0
+        Collections   = @()
+        ExitCode      = 2
+    }
+
+    try {
+        if ($ConfigPath) {
+            if (-not (Test-Path $ConfigPath)) {
+                throw "Config file not found: $ConfigPath"
+            }
+
+            # Get-AppConfig reads this path when no argument is given
+            $script:N2SConfigPath = $ConfigPath
+        }
+
+        if ($Quiet) {
+            $InformationPreference = 'SilentlyContinue'
+        }
+        else {
+            $InformationPreference = 'Continue'
+        }
+
+        $workflowResult = Invoke-MigrationWorkflow -Collections $Collections `
+                                                   -Operation $Operation `
+                                                   -DatabaseType $DatabaseType `
+                                                   -SampleSize $SampleSize `
+                                                   -Force
+
+        if ($null -eq $workflowResult) {
+            Write-Warning "No collections were processed"
+            $result.ExitCode = 1
+            return $result
+        }
+
+        return $workflowResult
+    }
+    catch {
+        Write-Error "Migration run failed: $($_.Exception.Message)"
+        $result.Error = $_.Exception.Message
+        return $result
+    }
+}
+
 function Get-CollectionResultStatus {
     <#
     .SYNOPSIS
@@ -4538,9 +4662,12 @@ function Invoke-MigrationWorkflow {
         [string]$DatabaseType = "MySQL",
         
         [Parameter(Mandatory=$false)]
-        [int]$SampleSize = 100
+        [int]$SampleSize = 100,
+
+        [Parameter(Mandatory=$false)]
+        [switch]$Force
     )
-    
+
     Write-Host "`n" + ("="*70) -ForegroundColor Cyan
     Write-Host "  NoSQL to SQL Migration Tool - Multi-Collection Workflow" -ForegroundColor Cyan
     Write-Host ("="*70) + "`n" -ForegroundColor Cyan
@@ -4559,9 +4686,11 @@ function Invoke-MigrationWorkflow {
         }
         
         Write-Host "Found $($discoveredCollections.Count) collection(s): $($discoveredCollections -join ', ')" -ForegroundColor Green
-        
-        # Ask for confirmation
-        $response = Read-Host "`nProcess ALL collections? (Y/N)"
+
+        # Ask for confirmation, unless the caller already decided. Without -Force
+        # this prompt blocks a scheduled task, which has no keyboard to answer it.
+        $response = if ($Force) { 'Y' } else { Read-Host "`nProcess ALL collections? (Y/N)" }
+
         if ($response -ne 'Y' -and $response -ne 'y') {
             Write-Host "Operation cancelled." -ForegroundColor Yellow
             return
@@ -5411,4 +5540,4 @@ function Start-MigrationTool {
 }
 
 
-Export-ModuleMember -Function Start-MigrationToolMenu, Invoke-MigrationWorkflow, Get-AppConfig
+Export-ModuleMember -Function Start-MigrationToolMenu, Invoke-MigrationWorkflow, Invoke-N2SMigration, Get-AppConfig
