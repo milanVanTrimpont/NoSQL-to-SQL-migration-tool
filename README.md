@@ -99,19 +99,37 @@ Open `config.json` and fill in your own server, port, database and password.
 | `MongoDB.ConnectionString` | for example `mongodb://localhost:27017` |
 | `MongoDB.Database` | the database holding the collections |
 | `MySQL.Server` / `Port` | `127.0.0.1` and `3307` for the container above |
-| `MySQL.Database` | must already exist; the tool creates tables, not databases |
+| `MySQL.Database` | must already exist, the tool creates tables, not databases |
 | `Migration.BatchSize` | documents per batch during a migration |
 | `Migration.OnConversionError` | `Warn` (default), `Skip` or `Fail`, see below |
 
 ### 6. Put something in MongoDB to migrate
 
-Skip this if you already have data. This creates a collection with a long text,
-two arrays, a sub-document and a date written in two different ways — the cases
-worth testing:
+Skip this if you already have data. The repository holds
+`stresstest_dataset.json`: 1000 documents that contain, on purpose, everything
+that can go wrong during a migration.
+
+| In the dataset | Why it is in there |
+|---|---|
+| one date field holding `2026-02-29`, `1970-01-01T00:00:00Z`, `2026-08-03 14:22:01` and `null` | several notations in the same field, plus a day that does not exist |
+| numbers as `8,6`, `129.99`, `-45.50` and `9999999999999` | decimal comma next to decimal point, and a value too large for an `int` |
+| text of 200 to 600 characters, emojis, quotes and backticks, and empty strings | column length, UTF-8, and characters that break a statement built by pasting text together |
+| `contact.address.coordinates.lat` | a sub-document three levels deep |
+| `tags` (array of text) and `history` (array of objects) | both kinds of child table |
+| `metadata.null_field` and `user_info.role` | a field that is null in every document, and one that is null now and then |
+
+Load it into MongoDB — this needs nothing besides `Mdbc`, so no `mongoimport`:
 
 ```powershell
-Import-Module Mdbc; Connect-Mdbc -ConnectionString "mongodb://localhost:27017" -DatabaseName "ScriptingPS" -CollectionName "films" -NewCollection; @( @{ title = "Heat"; storyline = ("plot " * 120); genres = @("Crime","Drama"); ratings = @(8,9,10); director = @{ name = "Michael Mann"; born = 1943 }; released = [datetime]"1995-12-15" }, @{ title = "Alien"; storyline = "short"; genres = @("Horror"); ratings = @(9); director = @{ name = "Ridley Scott"; born = 1937 }; released = "25/05/1979" } ) | ForEach-Object { Add-MdbcData $_ }
+Import-Module Mdbc; Connect-Mdbc -ConnectionString "mongodb://localhost:27017" -DatabaseName "ScriptingPS" -CollectionName "stresstest" -NewCollection; Get-Content .\stresstest_dataset.json -Raw | ConvertFrom-Json | Add-MdbcData
 ```
+
+`-NewCollection` empties the collection first, so running the line twice does not
+leave you with 2000 documents. Reading it in takes a few seconds.
+
+A full migration of this collection ends with seven tables: `stresstest` plus a
+child table for `user_info`, `contact`, `timestamps`, `metadata`, `tags` and
+`history`.
 
 ### 7. Check the connections
 
@@ -150,16 +168,16 @@ Or let `pwsh -File .\InteractiveMenu.ps1` do both in one go.
 |---|---|
 | 1 | test the MongoDB and MySQL connections |
 | 2 | list the collections in MongoDB |
-| 3, 4, 5 | full migration of one, several or all collections; asks how many documents to analyse |
+| 3, 4, 5 | full migration of one, several or all collections, asks how many documents to analyse |
 | 6, 7 | incremental sync of one or all collections |
 | 8 | validate a collection against MongoDB |
-| 9 | analyse the schema only, write nothing; asks how many documents to analyse |
+| 9 | analyse the schema only, write nothing, asks how many documents to analyse |
 | 10 | drop tables that have nothing behind them in MongoDB anymore |
 
 Option 10 finds two kinds of leftover table, and shows which kind each one is:
 
 * the **collection is gone** from MongoDB, so its table and child tables are
-  never visited again by a sync;
+  never visited again by a sync,
 * the collection still exists but a **field disappeared from every document**, so
   the child table that held that field is left behind with old rows.
 
@@ -188,7 +206,7 @@ It asks nothing and ends with an exit code:
 Useful variations:
 
 ```powershell
-pwsh -File .\Start-Migration.ps1 -Collections films,users -Operation FullMigration -SampleSize 500
+pwsh -File .\Start-Migration.ps1 -Collections stresstest,films -Operation FullMigration -SampleSize 500
 ```
 
 ```powershell
@@ -207,7 +225,7 @@ warnings, `2>` for errors, `-Verbose` for detail.
 
 ```powershell
 Import-Module .\NoSqlToSqlMigration\NoSqlToSqlMigration.psd1 -Force
-$result = Invoke-N2SMigration -Collections films -Operation FullMigration -SampleSize 500
+$result = Invoke-N2SMigration -Collections stresstest -Operation FullMigration -SampleSize 500
 exit $result.ExitCode
 ```
 
@@ -285,11 +303,11 @@ Measured on a collection of 1,000 documents with 10,000 child rows:
 | Repair after rows were deleted in SQL | ~2 s |
 
 A full sync only happens when the state file is missing or `-ForceFullSync` is
-given; day to day you are in the one-second case.
+given, day to day you are in the one-second case.
 
 **Why batching and not parallel processing:** the bottleneck was the number of
 round trips to the database, not a shortage of threads. Ten threads that each
-still write row by row only make that ten times less bad; one statement with 500
+still write row by row only make that ten times less bad, one statement with 500
 rows makes it a hundred times less bad. After this change the database is no
 longer the slowest part — the per-row work in PowerShell is, and that is where
 parallel runspaces would be the next step.
@@ -387,22 +405,6 @@ Check whether you are syncing all collections instead of the one you changed:
 option 7 in the menu, or `Start-Migration.ps1` without `-Collections`, walks the
 whole database.
 
----
-
-## Known limitations
-
-* A **changed value inside an existing child row** is not detected by a sync when
-  the number of rows still matches. Changes in MongoDB are caught by the document
-  hash; the row count check exists to catch changes made directly in SQL.
-* A **new array field** has no child table yet. The sync reports it; a full
-  migration creates the table.
-* **SQL Server** is not supported as a migration target, see above.
-* The **schema is based on a sample**. With a sample smaller than the collection a
-  field can be missed, and then its column will not exist.
-* **Field order counts** for change detection. The hash comes from the document's
-  BSON, which keeps the order the fields are stored in. If MongoDB writes them in
-  a different order after an update, the document is seen as changed and rewritten.
-  That costs a rewrite, not data.
 
 ---
 
