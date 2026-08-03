@@ -345,7 +345,15 @@ function Test-IsDocumentObject {
         return $false
     }
 
-    return ($Value -is [System.Collections.IDictionary] -or $Value -is [PSCustomObject])
+    if ($Value -is [System.Collections.IDictionary]) {
+        return $true
+    }
+
+    if ($null -ne $Value.PSObject -and $Value.PSObject.BaseObject -is [System.Management.Automation.PSCustomObject]) {
+        return $true
+    }
+
+    return $false
 }
 
 function Get-FieldType {
@@ -1234,8 +1242,10 @@ function ConvertTo-SQLDateTime {
     $styles = [System.Globalization.DateTimeStyles]::AllowWhiteSpaces
     $parsed = [DateTime]::MinValue
 
-    if ([DateTime]::TryParseExact($text, $formats, [System.Globalization.CultureInfo]::InvariantCulture, $styles, [ref]$parsed)) {
-        return $parsed
+    foreach ($format in $formats) {
+        if ([DateTime]::TryParseExact($text, $format, [System.Globalization.CultureInfo]::InvariantCulture, $styles, [ref]$parsed)) {
+            return $parsed
+        }
     }
 
     if ([DateTime]::TryParse($text, [System.Globalization.CultureInfo]::InvariantCulture, $styles, [ref]$parsed)) {

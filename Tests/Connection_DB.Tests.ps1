@@ -1,205 +1,129 @@
 <#
 .SYNOPSIS
-    Unit tests for Connection_DB.ps1 functions.
+Tests for the connection checks, the configuration and the entry point.
+
 .DESCRIPTION
-    This script contains Pester tests for the functions defined in Connection_DB.ps1.
+The database calls are mocked, so these tests say something about the code and
+not about whether a database happens to be running.
 #>
 
-# Load the Connection_DB.ps1 script
 BeforeAll {
-    $privatePath = Join-Path $PSScriptRoot "..\private"
+    Import-Module (Join-Path $PSScriptRoot "..\NoSqlToSqlMigration\NoSqlToSqlMigration.psd1") -Force
 
-    . (Join-Path $privatePath "Config.ps1")
-    . (Join-Path $privatePath "Connection_DB.ps1")
+    InModuleScope NoSqlToSqlMigration {
+        Set-N2SOutputMode -Mode Stream
+    }
 }
 
 Describe "Test-MongoDBConnection" {
 
-    BeforeEach {
-        Mock Connect-Mdbc {}
-        Mock Get-MdbcData { @(1,2,3) }
-        Mock Write-Host {}
-    }
-    
-    It "Returns true when MongoDB connection succeeds" {
-        Test-MongoDBConnection `
-            -ConnectionString "mongodb://fake" `
-            -DatabaseName "testdb" `
-            -CollectionName "users" |
-            Should -BeTrue
+    It "reports success when MongoDB answers" {
+        InModuleScope NoSqlToSqlMigration {
+            Mock Connect-Mdbc { }
+            Mock Get-MdbcData { 3 }
+
+            Test-MongoDBConnection -ConnectionString "mongodb://fake" -DatabaseName "db" -CollectionName "films" |
+                Should -BeTrue
+        }
     }
 
-    It "Returns false when MongoDB connection throws" {
-        Mock Connect-Mdbc { throw "Mongo error" }
+    It "reports failure instead of throwing when MongoDB does not answer" {
+        InModuleScope NoSqlToSqlMigration {
+            Mock Connect-Mdbc { throw "no route to host" }
 
-        Test-MongoDBConnection `
-            -ConnectionString "mongodb://fake" `
-            -DatabaseName "testdb" `
-            -CollectionName "users" |
-            Should -BeFalse
+            Test-MongoDBConnection -ConnectionString "mongodb://fake" -DatabaseName "db" -CollectionName "films" |
+                Should -BeFalse
+        }
+    }
+
+    It "works without a collection name" {
+        InModuleScope NoSqlToSqlMigration {
+            Mock Connect-Mdbc { }
+            Mock Get-MdbcData { 0 }
+
+            Test-MongoDBConnection -ConnectionString "mongodb://fake" -DatabaseName "db" | Should -BeTrue
+        }
     }
 }
 
-Describe "Test-MySQLConnection" {
+Describe "Get-AppConfig" {
 
-    BeforeEach {
-        Mock Add-Type {}
+    It "reads a configuration file" {
+        $path = Join-Path $TestDrive "config.json"
+        @{ MongoDB = @{ ConnectionString = "mongodb://x"; Database = "db" } } | ConvertTo-Json | Set-Content $path
 
-        Mock New-Object -ParameterFilter {
-            $TypeName -eq 'MySql.Data.MySqlClient.MySqlConnection'
-        } {
-            $conn = [pscustomobject]@{
-                ConnectionString = ""
-            }
+        $config = Get-AppConfig -Path $path
 
-            $conn | Add-Member ScriptMethod Open { return }
-            $conn | Add-Member ScriptMethod Close { return }
-
-            return $conn
-        }
-
-        Mock Write-Host {}
+        $config.MongoDB.Database | Should -Be "db"
     }
 
-    It "Returns true when MySQL connection succeeds" {
-        Test-MySQLConnection `
-            -Server "db" `
-            -Database "testdb" `
-            -Username "user" `
-            -Password "pass" |
-            Should -BeTrue
-    }
-
-    It "Returns false when MySQL driver is missing" {
-        Mock Add-Type { throw "Driver missing" }
-
-        Test-MySQLConnection `
-            -Server "db" `
-            -Database "testdb" `
-            -Username "user" `
-            -Password "pass" |
-            Should -BeFalse
+    It "says clearly when the file is missing" {
+        { Get-AppConfig -Path (Join-Path $TestDrive "nope.json") } | Should -Throw "*not found*"
     }
 }
 
-Describe "Test-SQLServerConnection" {
+Describe "Invoke-N2SMigration" {
 
-    BeforeEach {
-        Mock New-Object -ParameterFilter {
-            $TypeName -eq 'System.Data.SqlClient.SqlConnection'
-        } {
-            $conn = [pscustomobject]@{
-                ConnectionString = ""
-            }
+    It "reports a configuration problem as exit code 2 instead of throwing" {
+        # A scheduled task should get a usable exit code, not a stack trace
+        $result = Invoke-N2SMigration -Collections @("films") -ConfigPath (Join-Path $TestDrive "nope.json") -ErrorAction SilentlyContinue
 
-            $conn | Add-Member ScriptMethod Open { return }
-            $conn | Add-Member ScriptMethod Close { return }
+        $result.ExitCode | Should -Be 2
+    }
 
-            return $conn
+    It "never asks a question, even without a collection name" {
+        InModuleScope NoSqlToSqlMigration {
+            Mock Invoke-MigrationWorkflow { @{ TotalSuccess = 1; TotalFailed = 0; ExitCode = 0; Collections = @() } }
+            Mock Read-Host { throw "a question was asked in an automated run" }
+
+            $result = Invoke-N2SMigration -Operation ValidationOnly
+
+            $result.ExitCode | Should -Be 0
+            Should -Not -Invoke Read-Host
         }
-
-        Mock Write-Host {}
     }
 
-    It "Returns true when SQL Server connection succeeds" {
-        Test-SQLServerConnection `
-            -Server "sqlserver" `
-            -Database "testdb" |
-            Should -BeTrue
-    }
+    It "passes -Force to the workflow so the confirmation is skipped" {
+        InModuleScope NoSqlToSqlMigration {
+            Mock Invoke-MigrationWorkflow { @{ TotalSuccess = 0; TotalFailed = 0; ExitCode = 0; Collections = @() } }
 
-    It "Returns false when SQL Server connection throws" {
-        Mock New-Object -ParameterFilter {
-            $TypeName -eq 'System.Data.SqlClient.SqlConnection'
-        } { throw "SQL error" }
+            Invoke-N2SMigration -Operation ValidationOnly | Out-Null
 
-        Test-SQLServerConnection `
-            -Server "sqlserver" `
-            -Database "testdb" |
-            Should -BeFalse
+            Should -Invoke Invoke-MigrationWorkflow -ParameterFilter { $Force -eq $true } -Times 1
+        }
     }
 }
 
-Describe "Initialize-DatabaseConnections" {
+Describe "Write-N2SMessage" {
 
-    BeforeEach {
-        Mock Get-AppConfig {
-            @{
-                MongoDB = @{
-                    ConnectionString = "mongodb://fake"
-                    Database = "testdb"
-                    Collection = "users"
-                }
-                MySQL = @{
-                    Server = "db"
-                    Database = "testdb"
-                    Port = 3306
-                    Username = "u"
-                    Password = "p"
-                }
-            }
+    It "writes a warning to the warning stream in Stream mode" {
+        InModuleScope NoSqlToSqlMigration {
+            Set-N2SOutputMode -Mode Stream
+
+            $warning = Write-N2SMessage "let op" -Level Warning 3>&1
+
+            $warning.Message | Should -Be "let op"
         }
-
-        Mock Test-MongoDBConnection { $true }
-        Mock Test-MySQLConnection { $true }
-        Mock Test-SQLServerConnection { $true }
-
-        Mock Write-Host {}
     }
 
-    It "Returns true when all connections succeed (MySQL)" {
-        Initialize-DatabaseConnections -DatabaseType "MySQL" |
-            Should -BeTrue
+    It "writes an error to the error stream in Stream mode" {
+        InModuleScope NoSqlToSqlMigration {
+            Set-N2SOutputMode -Mode Stream
+
+            $errorRecord = Write-N2SMessage "mislukt" -Level Error 2>&1
+
+            $errorRecord.Exception.Message | Should -Be "mislukt"
+        }
     }
 
-    It "Returns false when MongoDB connection fails" {
-        Mock Test-MongoDBConnection { $false }
+    It "keeps detail out of the way unless it is asked for" {
+        InModuleScope NoSqlToSqlMigration {
+            Set-N2SOutputMode -Mode Stream
+            $VerbosePreference = 'SilentlyContinue'
 
-        Initialize-DatabaseConnections -DatabaseType "MySQL" |
-            Should -BeFalse
-    }
-}
+            $output = Write-N2SMessage "detail" -Level Detail 4>&1
 
-Describe "Get-SQLConnection" {
-
-    It "Returns MySQL connection object when DatabaseType is MySQL" {
-        Mock Add-Type {}
-
-        Mock New-Object -ParameterFilter {
-            $TypeName -eq 'MySql.Data.MySqlClient.MySqlConnection'
-        } {
-            [pscustomobject]@{ ConnectionString = "" }
+            $output | Should -BeNullOrEmpty
         }
-
-        $config = @{
-            MySQL = @{
-                Server = "db"
-                Port = 3306
-                Database = "testdb"
-                Username = "u"
-                Password = "p"
-            }
-        }
-
-        Get-SQLConnection -Config $config -DatabaseType "MySQL" |
-            Should -Not -BeNullOrEmpty
-    }
-
-    It "Returns SQL Server connection object when DatabaseType is SQLServer" {
-        Mock New-Object -ParameterFilter {
-            $TypeName -eq 'System.Data.SqlClient.SqlConnection'
-        } {
-            [pscustomobject]@{ ConnectionString = "" }
-        }
-
-        $config = @{
-            SQLServer = @{
-                Server = "sqlserver"
-                Database = "testdb"
-            }
-        }
-
-        Get-SQLConnection -Config $config -DatabaseType "SQLServer" |
-            Should -Not -BeNullOrEmpty
     }
 }

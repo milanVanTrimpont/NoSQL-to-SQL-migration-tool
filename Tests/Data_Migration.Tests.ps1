@@ -1,185 +1,359 @@
 <#
 .SYNOPSIS
-    Unit tests for Migration_Validation.ps1 functions.
+Tests for the conversion layer and for migrating a single document.
+
 .DESCRIPTION
-    This script contains Pester tests for the functions defined in Migration_Validation.ps1.
+The conversion layer is what keeps a difference in format from costing a
+document, so most of these tests describe a value that does not fit its column
+and what the tool does with it. No database is needed: the SQL connection is a
+stand-in that records the statements it is given.
 #>
+
 BeforeAll {
-    # Load the migration script
-    $scriptPath = Join-Path $PSScriptRoot "..\private\Data_Migration.ps1"
+    Import-Module (Join-Path $PSScriptRoot "..\NoSqlToSqlMigration\NoSqlToSqlMigration.psd1") -Force
 
-    if (-not (Test-Path $scriptPath)) {
-        throw "Test setup error: Data_Migration.ps1 not found at $scriptPath"
+    InModuleScope NoSqlToSqlMigration {
+        Set-N2SOutputMode -Mode Stream
     }
-
-    . $scriptPath
 }
 
+Describe "ConvertTo-SQLDateTime" {
 
-Describe "Test-MigrationValidation" {
+    It "keeps a value that is already a date" {
+        InModuleScope NoSqlToSqlMigration {
+            $result = ConvertTo-SQLDateTime -Value ([datetime]"2020-01-02T10:00:00")
+            $result.Year | Should -Be 2020
+        }
+    }
 
-    BeforeEach {
-        # standard mocks
-        Mock Get-AppConfig {
-            @{
-                MongoDB = @{
-                    ConnectionString = "mongodb://fake"
-                    Database = "testdb"
+    It "reads an ISO date" {
+        InModuleScope NoSqlToSqlMigration {
+            $result = ConvertTo-SQLDateTime -Value "2023-11-30"
+            $result.ToString('yyyy-MM-dd') | Should -Be "2023-11-30"
+        }
+    }
+
+    It "reads a day-first date" {
+        # 06/05/2022 is 6 May here, not 5 June
+        InModuleScope NoSqlToSqlMigration {
+            $result = ConvertTo-SQLDateTime -Value "06/05/2022"
+            $result.ToString('yyyy-MM-dd') | Should -Be "2022-05-06"
+        }
+    }
+
+    It "reads a date with a time" {
+        InModuleScope NoSqlToSqlMigration {
+            $result = ConvertTo-SQLDateTime -Value "2020-01-02 14:30:00"
+            $result.Hour | Should -Be 14
+        }
+    }
+
+    It "returns nothing for a value that is not a date" {
+        InModuleScope NoSqlToSqlMigration {
+            ConvertTo-SQLDateTime -Value "onbekend" | Should -BeNullOrEmpty
+        }
+    }
+
+    It "returns nothing for an empty value" {
+        InModuleScope NoSqlToSqlMigration {
+            ConvertTo-SQLDateTime -Value "" | Should -BeNullOrEmpty
+        }
+    }
+}
+
+Describe "ConvertTo-SQLColumnValue" {
+
+    It "puts a text date into a datetime column as a real date" {
+        InModuleScope NoSqlToSqlMigration {
+            $result = ConvertTo-SQLColumnValue -Value "06/05/2022" -ColumnType "datetime"
+
+            $result.Success | Should -BeTrue
+            $result.Value.ToString('yyyy-MM-dd') | Should -Be "2022-05-06"
+        }
+    }
+
+    It "reports a value that is not a date instead of failing the document" {
+        InModuleScope NoSqlToSqlMigration {
+            $result = ConvertTo-SQLColumnValue -Value "onbekend" -ColumnType "datetime"
+
+            $result.Success | Should -BeFalse
+            $result.Reason | Should -Match 'not a recognisable date'
+        }
+    }
+
+    It "reads a decimal comma as a decimal point" {
+        InModuleScope NoSqlToSqlMigration {
+            $result = ConvertTo-SQLColumnValue -Value "8,6" -ColumnType "decimal(18,2)"
+
+            $result.Success | Should -BeTrue
+            $result.Value | Should -Be 8.6
+        }
+    }
+
+    It "reports text that cannot be a number" {
+        InModuleScope NoSqlToSqlMigration {
+            $result = ConvertTo-SQLColumnValue -Value "veel" -ColumnType "int"
+
+            $result.Success | Should -BeFalse
+            $result.Reason | Should -Match 'not a whole number'
+        }
+    }
+
+    It "reports a value that is longer than its column" {
+        InModuleScope NoSqlToSqlMigration {
+            $result = ConvertTo-SQLColumnValue -Value ("x" * 300) -ColumnType "varchar(255)"
+
+            $result.Success | Should -BeFalse
+            $result.Reason | Should -Match 'does not fit'
+        }
+    }
+
+    It "writes a date into a text column in ISO notation" {
+        # Otherwise the same data looks different on a machine with other
+        # regional settings, and it does not sort correctly
+        InModuleScope NoSqlToSqlMigration {
+            $result = ConvertTo-SQLColumnValue -Value ([datetime]"2020-01-02T10:00:00") -ColumnType "varchar(255)"
+
+            $result.Success | Should -BeTrue
+            $result.Value | Should -Be "2020-01-02 10:00:00"
+        }
+    }
+
+    It "turns null into a database null" {
+        InModuleScope NoSqlToSqlMigration {
+            $result = ConvertTo-SQLColumnValue -Value $null -ColumnType "varchar(255)"
+
+            $result.Success | Should -BeTrue
+            $result.Value | Should -BeOfType [System.DBNull]
+        }
+    }
+
+    It "stores a boolean as 1 in an integer column" {
+        InModuleScope NoSqlToSqlMigration {
+            $result = ConvertTo-SQLColumnValue -Value $true -ColumnType "tinyint(1)"
+
+            $result.Success | Should -BeTrue
+            $result.Value | Should -Be 1
+        }
+    }
+}
+
+Describe "Get-ConversionErrorPolicy" {
+
+    It "defaults to Warn" {
+        InModuleScope NoSqlToSqlMigration {
+            Get-ConversionErrorPolicy -Config ([PSCustomObject]@{ Migration = [PSCustomObject]@{} }) | Should -Be 'Warn'
+        }
+    }
+
+    It "accepts the setting from the configuration" {
+        InModuleScope NoSqlToSqlMigration {
+            $config = [PSCustomObject]@{ Migration = [PSCustomObject]@{ OnConversionError = 'Skip' } }
+            Get-ConversionErrorPolicy -Config $config | Should -Be 'Skip'
+        }
+    }
+
+    It "ignores an unknown setting" {
+        InModuleScope NoSqlToSqlMigration {
+            $config = [PSCustomObject]@{ Migration = [PSCustomObject]@{ OnConversionError = 'Explode' } }
+            Get-ConversionErrorPolicy -Config $config | Should -Be 'Warn'
+        }
+    }
+}
+
+Describe "Invoke-DocumentMigration" {
+
+    BeforeAll {
+        # A stand-in for a SQL connection that records every statement it is
+        # given. Built here and handed to the module scope as a parameter,
+        # because a function from the test file is not visible in that scope.
+        function New-FakeConnection {
+            $log = [System.Collections.ArrayList]::new()
+
+            $connection = [PSCustomObject]@{ Log = $log }
+            $connection | Add-Member -MemberType ScriptMethod -Name CreateCommand -Value {
+                $command = [PSCustomObject]@{
+                    CommandText = ''
+                    Parameters  = [System.Collections.ArrayList]::new()
+                    Log         = $this.Log
                 }
-            }
-        }
 
-        Mock Connect-Mdbc {}
-        Mock Get-MdbcData {
-            param([switch]$Count, [int]$Last)
+                $command | Add-Member -MemberType ScriptMethod -Name CreateParameter -Value {
+                    [PSCustomObject]@{ ParameterName = ''; Value = $null }
+                }
 
-            if ($Count) {
-                return 5
-            }
+                $command | Add-Member -MemberType ScriptMethod -Name ExecuteNonQuery -Value {
+                    $this.Log.Add([PSCustomObject]@{
+                        Sql    = $this.CommandText
+                        Values = @($this.Parameters | ForEach-Object { $_.Value })
+                    }) | Out-Null
+                    return 1
+                }
 
-            # Sample Mongo docs
-            return @(
-                @{ _id = "1"; name = "Jan"; age = 30 }
-                @{ _id = "2"; name = "Piet"; age = 40 }
-            )
-        }
-
-        Mock Get-SQLConnectionObject {
-            $conn = New-Object PSObject -Property @{
-                State = "Closed"
+                return $command
             }
 
-            $conn | Add-Member -MemberType ScriptMethod -Name Open -Value { $this.State = "Open" }
-            $conn | Add-Member -MemberType ScriptMethod -Name Close -Value { $this.State = "Closed" }
-
-            $conn | Add-Member -MemberType ScriptMethod -Name CreateCommand -Value {
-                $cmd = New-Object PSObject
-                $cmd | Add-Member -MemberType NoteProperty -Name CommandText -Value ""
-                $cmd | Add-Member -MemberType ScriptMethod -Name ExecuteScalar -Value { 5 }
-                return $cmd
-            }
-
-            return $conn
+            return $connection
         }
-
-        Mock Get-SQLRecord {
-            param($Connection, $TableName, $Id)
-
-            return @{
-                _id  = $Id
-                name = if ($Id -eq "1") { "Jan" } else { "Piet" }
-                age  = if ($Id -eq "1") { 30 } else { 40 }
-            }
-        }
-
-        Mock Compare-DocumentToRecord {
-            @{
-                DocumentId     = "1"
-                Match          = $true
-                Differences    = @()
-                FieldsCompared = 3
-            }
-        }
-
-        Mock Test-DataIntegrity {
-            return @()
-        }
-
-        Mock Write-Host {}
-        Mock Write-Progress {}
     }
 
-    It "Geeft PASSED terug als alles klopt" {
-        $result = Test-MigrationValidation -TableName "klanten" -SampleSize 2
+    It "writes the scalar fields to the main table" {
+        $connection = New-FakeConnection
 
-        $result.OverallStatus | Should -Be "PASSED"
-        $result.RecordCountMatch | Should -BeTrue
-        $result.SamplesFailed | Should -Be 0
-        $result.Issues.Count | Should -Be 0
-    }
+        InModuleScope NoSqlToSqlMigration -Parameters @{ Connection = $connection } {
+            param($Connection)
 
-    It "Detecteert mismatch in record count" {
-        Mock Get-MdbcData {
-            param([switch]$Count)
-            if ($Count) { return 10 }
+            Mock Get-SQLTableColumns { @{ _id = 'varchar(24)'; title = 'varchar(255)'; year = 'varchar(255)' } }
+
+            $document = @{ _id = "abc"; title = "Heat"; year = "1995" }
+
+            Invoke-DocumentMigration -Document $document -Connection $Connection -TableName "films" `
+                                     -Schema @{} -DatabaseType "MySQL" | Should -BeTrue
         }
 
-        $result = Test-MigrationValidation -TableName "klanten"
-
-        $result.RecordCountMatch | Should -BeFalse
-        $result.Issues | Should -ContainMatch "Record count mismatch"
+        $insert = $connection.Log | Where-Object { $_.Sql -match 'REPLACE INTO' }
+        $insert | Should -Not -BeNullOrEmpty
+        $insert.Values | Should -Contain "Heat"
     }
 
-    It "Zet status op FAILED als samples falen" {
-        Mock Compare-DocumentToRecord {
-            @{
-                DocumentId     = "1"
-                Match          = $false
-                Differences    = @("age mismatch")
-                FieldsCompared = 3
-            }
+    It "skips a field that has no column in the table" {
+        # The schema comes from a sample, so a document can hold a field that
+        # was never seen. That must not cost the whole document.
+        $connection = New-FakeConnection
+
+        InModuleScope NoSqlToSqlMigration -Parameters @{ Connection = $connection } {
+            param($Connection)
+
+            Mock Get-SQLTableColumns { @{ _id = 'varchar(24)'; title = 'varchar(255)' } }
+
+            $document = @{ _id = "abc"; title = "Heat"; unexpected = "surprise" }
+
+            Invoke-DocumentMigration -Document $document -Connection $Connection -TableName "films" `
+                                     -Schema @{} -DatabaseType "MySQL" | Should -BeTrue
         }
 
-        $result = Test-MigrationValidation -TableName "klanten" -SampleSize 1
-
-        $result.SamplesFailed | Should -BeGreaterThan 0
-        $result.OverallStatus | Should -Be "FAILED"
+        $insert = $connection.Log | Where-Object { $_.Sql -match 'REPLACE INTO' }
+        $insert.Sql | Should -Not -Match 'unexpected'
     }
 
-    It "Zet status op ERROR bij exception" {
+    It "stores an unconvertible value as NULL and keeps the document" {
+        $connection = New-FakeConnection
 
-        Mock Get-SQLConnectionObject {
-            $conn = New-Object PSObject
-            $conn | Add-Member ScriptMethod Open { throw "SQL open failed" }
-            $conn | Add-Member ScriptMethod Close {}
-            $conn | Add-Member NoteProperty State "Closed"
-            return $conn
+        InModuleScope NoSqlToSqlMigration -Parameters @{ Connection = $connection } {
+            param($Connection)
+
+            Mock Get-SQLTableColumns { @{ _id = 'varchar(24)'; created = 'datetime' } }
+            $script:N2SConversionPolicy = 'Warn'
+            $script:N2SConversionIssues = @()
+
+            $document = @{ _id = "abc"; created = "onbekend" }
+
+            Invoke-DocumentMigration -Document $document -Connection $Connection -TableName "films" `
+                                     -Schema @{} -DatabaseType "MySQL" | Should -BeTrue
+
+            $script:N2SConversionIssues.Count | Should -Be 1
+            $script:N2SConversionIssues[0].Action | Should -Be 'stored as NULL'
+        }
+    }
+
+    It "skips the document when the policy says Skip" {
+        $connection = New-FakeConnection
+
+        InModuleScope NoSqlToSqlMigration -Parameters @{ Connection = $connection } {
+            param($Connection)
+
+            Mock Get-SQLTableColumns { @{ _id = 'varchar(24)'; created = 'datetime' } }
+            $script:N2SConversionPolicy = 'Skip'
+            $script:N2SConversionIssues = @()
+
+            $document = @{ _id = "abc"; created = "onbekend" }
+
+            Invoke-DocumentMigration -Document $document -Connection $Connection -TableName "films" `
+                                     -Schema @{} -DatabaseType "MySQL" | Should -BeFalse
+
+            $script:N2SConversionIssues[0].Action | Should -Be 'document skipped'
+            $script:N2SConversionPolicy = 'Warn'
+        }
+    }
+
+    It "sends arrays to their child table instead of the main table" {
+        $connection = New-FakeConnection
+
+        InModuleScope NoSqlToSqlMigration -Parameters @{ Connection = $connection } {
+            param($Connection)
+
+            Mock Get-SQLTableColumns { @{ _id = 'varchar(24)'; title = 'varchar(255)' } }
+            Mock Invoke-ChildTableMigration { return 2 }
+
+            $document = @{ _id = "abc"; title = "Heat"; genres = @("Crime", "Drama") }
+            $sqlSchema = @{ MainTable = "films"; Tables = @("films", "films_genres") }
+
+            Invoke-DocumentMigration -Document $document -Connection $Connection -TableName "films" `
+                                     -Schema @{} -DatabaseType "MySQL" -SQLSchema $sqlSchema | Should -BeTrue
+
+            Should -Invoke Invoke-ChildTableMigration -Times 1 -Exactly
         }
 
-        $result = Test-MigrationValidation -TableName "klanten"
-
-        $result.OverallStatus | Should -Be "ERROR"
-        $result.Issues[0] | Should -Match "Validation error"
+        $insert = $connection.Log | Where-Object { $_.Sql -match 'REPLACE INTO' }
+        $insert.Sql | Should -Not -Match 'genres'
     }
-
 }
 
 Describe "Normalize-ValueForComparison" {
 
-    It "Converteert boolean true naar 1" {
-        Normalize-ValueForComparison -Value $true -DatabaseType "MySQL" | Should -Be "1"
+    It "compares numbers by value, not by notation" {
+        # MySQL returns DECIMAL(18,2) as 8.30 where MongoDB holds 8.3
+        InModuleScope NoSqlToSqlMigration {
+            $mongo = Normalize-ValueForComparison -Value 8.3 -DatabaseType "MySQL"
+            $sql = Normalize-ValueForComparison -Value ([decimal]8.30) -DatabaseType "MySQL"
+
+            $mongo | Should -Be $sql
+        }
     }
 
-    It "Converteert DateTime correct" {
-        $dt = Get-Date "2024-01-01 12:30:00"
-        Normalize-ValueForComparison -Value $dt -DatabaseType "MySQL" |
-            Should -Be "2024-01-01 12:30:00"
+    It "turns a boolean into 1" {
+        InModuleScope NoSqlToSqlMigration {
+            Normalize-ValueForComparison -Value $true -DatabaseType "MySQL" | Should -Be "1"
+        }
     }
 
-    It "Geeft lege string bij null" {
-        Normalize-ValueForComparison -Value $null -DatabaseType "MySQL" | Should -Be ""
+    It "turns null into an empty string" {
+        InModuleScope NoSqlToSqlMigration {
+            Normalize-ValueForComparison -Value $null -DatabaseType "MySQL" | Should -Be ""
+        }
     }
 }
 
 Describe "Compare-DocumentToRecord" {
 
-    It "Geeft Match=true bij gelijke velden" {
-        $mongo = @{ _id = "1"; name = "Jan"; age = 30 }
-        $sql   = @{ _id = "1"; name = "Jan"; age = 30 }
+    It "reports a match when the values are the same" {
+        InModuleScope NoSqlToSqlMigration {
+            $document = @{ _id = "abc"; title = "Heat" }
+            $record = @{ _id = "abc"; title = "Heat" }
 
-        $result = Compare-DocumentToRecord -MongoDocument $mongo -SQLRecord $sql -DatabaseType "MySQL"
-
-        $result.Match | Should -BeTrue
-        $result.Differences.Count | Should -Be 0
+            (Compare-DocumentToRecord -MongoDocument $document -SQLRecord $record -DatabaseType "MySQL").Match | Should -BeTrue
+        }
     }
 
-    It "Detecteert ontbrekend veld in SQL" {
-        $mongo = @{ _id = "1"; name = "Jan"; age = 30 }
-        $sql   = @{ _id = "1"; name = "Jan" }
+    It "reports a field that is missing in SQL" {
+        InModuleScope NoSqlToSqlMigration {
+            $document = @{ _id = "abc"; title = "Heat" }
+            $record = @{ _id = "abc" }
 
-        $result = Compare-DocumentToRecord -MongoDocument $mongo -SQLRecord $sql -DatabaseType "MySQL"
+            $result = Compare-DocumentToRecord -MongoDocument $document -SQLRecord $record -DatabaseType "MySQL"
 
-        $result.Match | Should -BeFalse
-        $result.Differences | Should -Contain "age missing in SQL"
+            $result.Match | Should -BeFalse
+            $result.Differences -join ' ' | Should -Match 'title missing in SQL'
+        }
+    }
+
+    It "accepts a text date that was stored as a real date" {
+        # Otherwise every converted value looks like a difference
+        InModuleScope NoSqlToSqlMigration {
+            $document = @{ _id = "abc"; created = "06/05/2022" }
+            $record = @{ _id = "abc"; created = [datetime]"2022-05-06" }
+
+            (Compare-DocumentToRecord -MongoDocument $document -SQLRecord $record -DatabaseType "MySQL").Match | Should -BeTrue
+        }
     }
 }

@@ -1,147 +1,287 @@
 <#
-<#
 .SYNOPSIS
-    Unit tests for Migration_Validation.ps1 functions.
+Tests for change detection and the child tables during a sync.
+
 .DESCRIPTION
-    This script contains Pester tests for the functions defined in Migration_Validation.ps1.
+A sync has to notice two kinds of change: something changed in MongoDB, and
+something changed in SQL. The first is caught by the document hash, the second
+by comparing child row counts.
 #>
+
 BeforeAll {
-    . "$PSScriptRoot\..\private\Migration_Validation.ps1"
+    Import-Module (Join-Path $PSScriptRoot "..\NoSqlToSqlMigration\NoSqlToSqlMigration.psd1") -Force
+
+    InModuleScope NoSqlToSqlMigration {
+        Set-N2SOutputMode -Mode Stream
+    }
 }
 
-Describe "Start-IncrementalSync" {
+Describe "Get-DocumentHash" {
 
-    BeforeEach {
+    It "gives the same hash for the same document" {
+        InModuleScope NoSqlToSqlMigration {
+            $document = @{ _id = "abc"; title = "Heat"; ratings = @(8, 9) }
 
-        # standard mocks
-        Mock Write-Host {}
-        Mock Connect-Mdbc {}
-
-        Mock Get-AppConfig {
-            @{
-                MongoDB = @{
-                    ConnectionString = "mongodb://fake"
-                    Database = "testdb"
-                }
-            }
-        }
-
-        # Fake SQL connection
-        Mock Get-SQLConnectionObject {
-            $conn = New-Object PSObject -Property @{ State = "Closed" }
-            $conn | Add-Member ScriptMethod Open { $this.State = "Open" }
-            $conn | Add-Member ScriptMethod Close { $this.State = "Closed" }
-            return $conn
-        }
-
-        Mock Update-SQLSchema { $false }
-
-        Mock Save-SyncState {}
-    }
-
-    Context "Full sync (geen sync state)" {
-
-        BeforeEach {
-            Mock Get-SyncState { $null }
-
-            Mock Get-MdbcData {
-                @(
-                    @{ _id = "1"; name = "Jan" }
-                    @{ _id = "2"; name = "Piet" }
-                )
-            }
-
-            Mock Get-AllSQLRecords {
-                @{ }
-            }
-
-            Mock Get-DocumentHash { "HASH" }
-
-            Mock Invoke-InsertDocument { $true }
-            Mock Invoke-UpdateDocument { $true }
-            Mock Invoke-DeleteDocument { $true }
-        }
-
-        It "Voert FULL sync uit en insert nieuwe records" {
-            $result = Start-IncrementalSync -TableName "klanten"
-
-            $result.IsFullSync | Should -BeTrue
-            $result.NewRecords | Should -Be 2
-            $result.UpdatedRecords | Should -Be 0
-            $result.DeletedRecords | Should -Be 0
-            $result.Errors.Count | Should -Be 0
+            Get-DocumentHash -Document $document | Should -Be (Get-DocumentHash -Document $document)
         }
     }
 
-    Context "Incremental sync met wijzigingen" {
+    It "notices a changed scalar field" {
+        InModuleScope NoSqlToSqlMigration {
+            $before = Get-DocumentHash -Document @{ _id = "abc"; title = "Heat" }
+            $after = Get-DocumentHash -Document @{ _id = "abc"; title = "Heat 2" }
 
-        BeforeEach {
-            Mock Get-SyncState {
-                @{
-                    LastSyncTime = (Get-Date).AddHours(-1)
-                    DocumentHashes = @{
-                        "1" = "OLDHASH"
-                        "2" = "SAMEHASH"
-                        "3" = "TODELETE"
-                    }
-                }
-            }
-
-            Mock Get-MdbcData {
-                @(
-                    @{ _id = "1"; name = "Jan gewijzigd" } # updated
-                    @{ _id = "2"; name = "Piet" }           # unchanged
-                    @{ _id = "4"; name = "Klaas" }          # new
-                )
-            }
-
-            Mock Get-AllSQLRecords {
-                @{
-                    "1" = $true
-                    "2" = $true
-                    "3" = $true
-                }
-            }
-
-            Mock Get-DocumentHash {
-                param($Document)
-                switch ($Document._id) {
-                    "1" { "NEWHASH" }
-                    "2" { "SAMEHASH" }
-                    "4" { "HASH4" }
-                }
-            }
-
-            Mock Invoke-InsertDocument { $true }
-            Mock Invoke-UpdateDocument { $true }
-            Mock Invoke-DeleteDocument { $true }
-        }
-
-        It "Detecteert new, updated, deleted en unchanged records correct" {
-            $result = Start-IncrementalSync -TableName "klanten"
-
-            $result.IsFullSync | Should -BeFalse
-            $result.NewRecords | Should -Be 1
-            $result.UpdatedRecords | Should -Be 1
-            $result.DeletedRecords | Should -Be 1
-            $result.UnchangedRecords | Should -Be 1
-            $result.TotalProcessed | Should -Be 3
-            $result.Errors.Count | Should -Be 0
+            $before | Should -Not -Be $after
         }
     }
 
-    Context "Foutafhandeling" {
+    It "notices an extra element in an array" {
+        # Regression: the hash only covered scalar fields, so a rating added in
+        # MongoDB never marked the document as changed and never reached SQL.
+        InModuleScope NoSqlToSqlMigration {
+            $before = Get-DocumentHash -Document @{ _id = "abc"; ratings = @(8, 9) }
+            $after = Get-DocumentHash -Document @{ _id = "abc"; ratings = @(8, 9, 10) }
 
-        BeforeEach {
-            Mock Get-SyncState { $null }
-            Mock Get-MdbcData { throw "Mongo failure" }
+            $before | Should -Not -Be $after
+        }
+    }
+
+    It "notices a changed field inside a sub-document" {
+        InModuleScope NoSqlToSqlMigration {
+            $before = Get-DocumentHash -Document @{ _id = "abc"; address = @{ city = "Gent" } }
+            $after = Get-DocumentHash -Document @{ _id = "abc"; address = @{ city = "Brugge" } }
+
+            $before | Should -Not -Be $after
+        }
+    }
+
+    It "does not depend on the order of the fields" {
+        InModuleScope NoSqlToSqlMigration {
+            $one = Get-DocumentHash -Document ([ordered]@{ a = 1; b = 2 })
+            $two = Get-DocumentHash -Document ([ordered]@{ b = 2; a = 1 })
+
+            $one | Should -Be $two
+        }
+    }
+
+    It "does depend on the order of array elements" {
+        InModuleScope NoSqlToSqlMigration {
+            $one = Get-DocumentHash -Document @{ tags = @("a", "b") }
+            $two = Get-DocumentHash -Document @{ tags = @("b", "a") }
+
+            $one | Should -Not -Be $two
+        }
+    }
+}
+
+Describe "ConvertTo-HashableString" {
+
+    It "writes a number the same way on every machine" {
+        InModuleScope NoSqlToSqlMigration {
+            ConvertTo-HashableString -Value 8.6 | Should -Be "8.6"
+        }
+    }
+
+    It "writes a date in a fixed notation" {
+        InModuleScope NoSqlToSqlMigration {
+            ConvertTo-HashableString -Value ([datetime]"2020-01-02T10:00:00") | Should -Match '^2020-01-02T10:00:00'
+        }
+    }
+
+    It "marks null" {
+        InModuleScope NoSqlToSqlMigration {
+            ConvertTo-HashableString -Value $null | Should -Be "null"
+        }
+    }
+}
+
+Describe "Get-ExpectedChildRowCount" {
+
+    It "counts the elements of an array" {
+        InModuleScope NoSqlToSqlMigration {
+            Get-ExpectedChildRowCount -Document @{ genres = @("a", "b", "c") } -FieldName "genres" | Should -Be 3
+        }
+    }
+
+    It "counts a sub-document as one row" {
+        InModuleScope NoSqlToSqlMigration {
+            Get-ExpectedChildRowCount -Document @{ address = @{ city = "Gent" } } -FieldName "address" | Should -Be 1
+        }
+    }
+
+    It "counts a missing field as zero" {
+        InModuleScope NoSqlToSqlMigration {
+            Get-ExpectedChildRowCount -Document @{ title = "Heat" } -FieldName "genres" | Should -Be 0
+        }
+    }
+}
+
+Describe "Test-ChildRowDrift" {
+
+    It "sees no drift when the counts match" {
+        InModuleScope NoSqlToSqlMigration {
+            $document = @{ _id = "abc"; genres = @("a", "b") }
+            $childTables = @{ genres = "films_genres" }
+            $counts = @{ genres = @{ abc = 2 } }
+
+            Test-ChildRowDrift -Document $document -DocumentId "abc" -ChildTables $childTables -ChildRowCounts $counts |
+                Should -BeFalse
+        }
+    }
+
+    It "sees drift when rows were removed straight from SQL" {
+        # This is the case that a hash can never catch: MongoDB did not change
+        InModuleScope NoSqlToSqlMigration {
+            $document = @{ _id = "abc"; genres = @("a", "b") }
+            $childTables = @{ genres = "films_genres" }
+            $counts = @{ genres = @{ abc = 0 } }
+
+            Test-ChildRowDrift -Document $document -DocumentId "abc" -ChildTables $childTables -ChildRowCounts $counts |
+                Should -BeTrue
+        }
+    }
+
+    It "sees drift when the child table holds too many rows" {
+        InModuleScope NoSqlToSqlMigration {
+            $document = @{ _id = "abc"; genres = @("a") }
+            $childTables = @{ genres = "films_genres" }
+            $counts = @{ genres = @{ abc = 5 } }
+
+            Test-ChildRowDrift -Document $document -DocumentId "abc" -ChildTables $childTables -ChildRowCounts $counts |
+                Should -BeTrue
+        }
+    }
+
+    It "sees no drift when there are no child tables" {
+        InModuleScope NoSqlToSqlMigration {
+            Test-ChildRowDrift -Document @{ _id = "abc" } -DocumentId "abc" -ChildTables @{} -ChildRowCounts @{} |
+                Should -BeFalse
+        }
+    }
+}
+
+Describe "Get-ChildTableMap" {
+
+    It "only accepts tables that carry the parent key column" {
+        # A table whose name happens to start with the same prefix must be
+        # left alone
+        $connection = [PSCustomObject]@{}
+        $connection | Add-Member -MemberType ScriptMethod -Name CreateCommand -Value {
+            $command = [PSCustomObject]@{ CommandText = '' }
+            $command | Add-Member -MemberType ScriptMethod -Name ExecuteReader -Value {
+                # A stand-in for SHOW TABLES: it walks its own row list
+                $reader = [PSCustomObject]@{
+                    Rows  = @("films_genres", "films_archive")
+                    Index = -1
+                }
+                $reader | Add-Member -MemberType ScriptMethod -Name Read -Value {
+                    $this.Index++
+                    return ($this.Index -lt $this.Rows.Count)
+                }
+                $reader | Add-Member -MemberType ScriptMethod -Name GetString -Value {
+                    param($i)
+                    return $this.Rows[$this.Index]
+                }
+                $reader | Add-Member -MemberType ScriptMethod -Name Close -Value { }
+
+                return $reader
+            }
+            return $command
         }
 
-        It "Vangt exceptions en vult Errors" {
-            $result = Start-IncrementalSync -TableName "klanten"
+        InModuleScope NoSqlToSqlMigration -Parameters @{ Connection = $connection } {
+            param($Connection)
 
-            $result.Errors.Count | Should -Be 1
-            $result.Errors[0] | Should -Match "Sync error"
+            Mock Get-SQLTableColumns {
+                if ($TableName -eq 'films_genres') {
+                    return @{ films__id = 'varchar(24)'; array_index = 'int'; value = 'varchar(255)' }
+                }
+                return @{ id = 'int'; note = 'varchar(255)' }
+            }
+
+            $map = Get-ChildTableMap -Connection $Connection -TableName "films" -PrimaryKeyField "_id"
+
+            $map.ContainsKey('genres') | Should -BeTrue
+            $map.ContainsKey('archive') | Should -BeFalse
+        }
+    }
+}
+
+Describe "Get-CollectionResultStatus" {
+
+    It "calls a clean run a success" {
+        InModuleScope NoSqlToSqlMigration {
+            $details = @{ Migration = @{ FailedDocuments = 0; TotalDocuments = 10; ConversionIssues = @() } }
+
+            (Get-CollectionResultStatus -Details $details).Success | Should -BeTrue
+        }
+    }
+
+    It "calls a run with failed documents a failure" {
+        InModuleScope NoSqlToSqlMigration {
+            $details = @{ Migration = @{ FailedDocuments = 3; TotalDocuments = 10; ConversionIssues = @() } }
+            $status = Get-CollectionResultStatus -Details $details
+
+            $status.Success | Should -BeFalse
+            $status.Reason | Should -Match '3 of 10'
+        }
+    }
+
+    It "calls a sync with errors a failure" {
+        # Regression: a sync caught its own errors and returned normally, after
+        # which the workflow reported "completed successfully"
+        InModuleScope NoSqlToSqlMigration {
+            $details = @{ Sync = @{ Errors = @("Failed to insert document abc") } }
+            $status = Get-CollectionResultStatus -Details $details
+
+            $status.Success | Should -BeFalse
+            $status.Reason | Should -Match 'sync reported 1 error'
+        }
+    }
+
+    It "calls a failed validation a failure" {
+        InModuleScope NoSqlToSqlMigration {
+            $details = @{ Validation = @{ OverallStatus = 'FAILED'; Issues = @("x"); RecordCountMatch = $true } }
+
+            (Get-CollectionResultStatus -Details $details).Success | Should -BeFalse
+        }
+    }
+
+    It "calls a count mismatch a failure, even when most samples pass" {
+        InModuleScope NoSqlToSqlMigration {
+            $details = @{ Validation = @{ OverallStatus = 'PARTIAL'; Issues = @("x"); RecordCountMatch = $false
+                                          MongoCount = 10; SQLCount = 8 } }
+            $status = Get-CollectionResultStatus -Details $details
+
+            $status.Success | Should -BeFalse
+            $status.Reason | Should -Match 'record counts do not match'
+        }
+    }
+
+    It "treats a conversion problem as a warning, not a failure" {
+        # Storing the value as NULL is what OnConversionError = Warn asks for
+        InModuleScope NoSqlToSqlMigration {
+            $details = @{ Migration = @{ FailedDocuments = 0; TotalDocuments = 10
+                                         ConversionIssues = @([PSCustomObject]@{ Field = 'created' }) } }
+            $status = Get-CollectionResultStatus -Details $details
+
+            $status.Success | Should -BeTrue
+            $status.Warning | Should -Match 'could not be converted'
+        }
+    }
+
+    It "keeps both warnings when there are two" {
+        InModuleScope NoSqlToSqlMigration {
+            $details = @{
+                Migration  = @{ FailedDocuments = 0; TotalDocuments = 10
+                                ConversionIssues = @([PSCustomObject]@{ Field = 'created' }) }
+                Validation = @{ OverallStatus = 'PARTIAL'; Issues = @("x"); RecordCountMatch = $true }
+            }
+            $status = Get-CollectionResultStatus -Details $details
+
+            $status.Success | Should -BeTrue
+            $status.Warning | Should -Match 'could not be converted'
+            $status.Warning | Should -Match 'PARTIAL'
         }
     }
 }
