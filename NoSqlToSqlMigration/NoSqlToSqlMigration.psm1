@@ -3325,6 +3325,7 @@ function Start-IncrementalSync {
         TotalProcessed = 0
         RepairedChildRecords = 0
         ChildRecords = @{}
+        GhostChildTables = @()
         Errors = @()
         Warnings = @()
         LastSyncTime = $null
@@ -3422,6 +3423,21 @@ function Start-IncrementalSync {
             Write-N2SMessage " Field '$fieldName' has no child table - run a Full Migration to create it" -Level Step
             $syncResult.Warnings += "Field '$fieldName' has no child table; run a Full Migration for $TableName"
         }
+
+        # The other way round: a child table whose field is gone from every
+        # document. Its rows describe something that no longer exists, and the
+        # orphan check cannot see it because the collection itself still exists.
+        # Every document was read above, so this is not a guess from a sample.
+        $ghostTables = @(Get-GhostChildTable -Connection $sqlConnection `
+                                             -TableName $TableName `
+                                             -Documents $mongoDocuments)
+
+        foreach ($ghost in $ghostTables) {
+            Write-N2SMessage " Child table '$($ghost.Table)' still holds $($ghost.Rows) row(s), but field '$($ghost.Field)' is gone from every document" -Level Warning
+            $syncResult.Warnings += "Child table '$($ghost.Table)' is left over from field '$($ghost.Field)'; clean it up with menu option 10"
+        }
+
+        $syncResult.GhostChildTables = @($ghostTables | Select-Object -ExpandProperty Table)
 
         # Step 3: Get current SQL records
         Write-N2SMessage "`nStep 2: Loading existing SQL records..." -Level Step
@@ -4526,6 +4542,12 @@ function Invoke-N2SMigration {
     .PARAMETER Quiet
     Suppress the progress output; warnings and errors are still reported.
 
+    .PARAMETER RemoveOrphanTables
+    Drop SQL tables whose MongoDB collection no longer exists, including their
+    data. Without this switch such tables are only reported. In an automated run
+    there is nobody to answer a confirmation, so giving this switch counts as the
+    confirmation itself.
+
     .OUTPUTS
     The workflow result, including ExitCode (0 = fine, 1 = a collection failed).
 
@@ -4559,7 +4581,10 @@ function Invoke-N2SMigration {
         [string]$ConfigPath,
 
         [Parameter(Mandatory=$false)]
-        [switch]$Quiet
+        [switch]$Quiet,
+
+        [Parameter(Mandatory=$false)]
+        [switch]$RemoveOrphanTables
     )
 
     # An unreachable database or a broken configuration should come out as a
@@ -4594,11 +4619,19 @@ function Invoke-N2SMigration {
             $InformationPreference = 'Continue'
         }
 
+        if ($RemoveOrphanTables) {
+            # There is no keyboard here to answer a confirmation, so passing
+            # -RemoveOrphanTables to an automated run IS the confirmation
+            Write-Warning "Orphan tables will be dropped without asking, including their data"
+            $ConfirmPreference = 'None'
+        }
+
         $workflowResult = Invoke-MigrationWorkflow -Collections $Collections `
                                                    -Operation $Operation `
                                                    -DatabaseType $DatabaseType `
                                                    -SampleSize $SampleSize `
-                                                   -Force
+                                                   -Force `
+                                                   -RemoveOrphanTables:$RemoveOrphanTables
 
         if ($null -eq $workflowResult) {
             Write-Warning "No collections were processed"
@@ -4617,6 +4650,219 @@ function Invoke-N2SMigration {
         # The menu expects coloured output on screen again
         Set-N2SOutputMode -Mode Console
     }
+}
+
+function Get-OrphanSQLTable {
+    <#
+    .SYNOPSIS
+    Finds SQL tables that no longer have a MongoDB collection behind them
+
+    .DESCRIPTION
+    A collection that is removed from MongoDB leaves its SQL table behind: a sync
+    of all collections works from the list in MongoDB, so a table whose
+    collection is gone is never visited again. Child tables are named
+    <collection>_<field>, so they belong to their parent collection.
+
+    .PARAMETER Connection
+    An open SQL connection.
+
+    .PARAMETER Collections
+    The collections that do exist in MongoDB.
+
+    .OUTPUTS
+    One object per orphan table, with its name and row count.
+    #>
+
+    param (
+        $Connection,
+        [string[]]$Collections
+    )
+
+    $orphans = @()
+    $tables = @()
+
+    try {
+        $cmd = $Connection.CreateCommand()
+        $cmd.CommandText = "SHOW TABLES"
+        $reader = $cmd.ExecuteReader()
+
+        while ($reader.Read()) {
+            $tables += $reader.GetString(0)
+        }
+        $reader.Close()
+    }
+    catch {
+        Write-N2SMessage "Warning: could not list tables: $($_.Exception.Message)" -Level Warning
+        return $orphans
+    }
+
+    foreach ($table in $tables) {
+        $owned = $false
+
+        foreach ($collectionName in $Collections) {
+            if ($table -eq $collectionName -or $table.StartsWith("${collectionName}_")) {
+                $owned = $true
+                break
+            }
+        }
+
+        if (-not $owned) {
+            $rowCount = Get-SQLTableRowCount -Connection $Connection -TableName $table
+
+            $orphans += [PSCustomObject]@{
+                Table = $table
+                Rows  = if ($null -ne $rowCount) { $rowCount } else { 0 }
+            }
+        }
+    }
+
+    return $orphans
+}
+
+function Get-DocumentChildFieldName {
+    <#
+    .SYNOPSIS
+    Names of the fields in these documents that need a child table
+
+    .DESCRIPTION
+    Arrays and sub-documents are the fields that get their own table. Every other
+    field is a column of the main table.
+    #>
+
+    param (
+        $Documents
+    )
+
+    $fields = @{}
+
+    foreach ($document in $Documents) {
+        if ($document -isnot [System.Collections.IDictionary]) {
+            continue
+        }
+
+        foreach ($key in $document.Keys) {
+            $value = $document[$key]
+
+            if ((Test-IsDocumentObject -Value $value) -or
+                ($null -ne $value -and $value -is [System.Collections.IEnumerable] -and $value -isnot [string])) {
+                $fields[$key] = $true
+            }
+        }
+    }
+
+    return $fields
+}
+
+function Get-GhostChildTable {
+    <#
+    .SYNOPSIS
+    Child tables of a collection whose field no longer exists in any document
+
+    .DESCRIPTION
+    The collection itself is still there, so the orphan check does not see these.
+    Yet a field that disappeared from every document leaves its child table
+    behind with rows that describe something that no longer exists.
+
+    Only pass documents that cover the whole collection: a field that happens to
+    be missing from a sample would otherwise look like it is gone.
+    #>
+
+    param (
+        $Connection,
+        [string]$TableName,
+        $Documents,
+        [string]$PrimaryKeyField = "_id"
+    )
+
+    $ghosts = @()
+    $childTables = Get-ChildTableMap -Connection $Connection -TableName $TableName -PrimaryKeyField $PrimaryKeyField
+
+    if ($childTables.Count -eq 0) {
+        return $ghosts
+    }
+
+    $presentFields = Get-DocumentChildFieldName -Documents $Documents
+
+    foreach ($fieldName in $childTables.Keys) {
+        if (-not $presentFields.ContainsKey($fieldName)) {
+            $table = $childTables[$fieldName]
+            $rowCount = Get-SQLTableRowCount -Connection $Connection -TableName $table
+
+            $ghosts += [PSCustomObject]@{
+                Table = $table
+                Field = $fieldName
+                Rows  = if ($null -ne $rowCount) { $rowCount } else { 0 }
+            }
+        }
+    }
+
+    return $ghosts
+}
+
+function Remove-OrphanSQLTable {
+    <#
+    .SYNOPSIS
+    Drops one orphan table, after confirmation
+
+    .DESCRIPTION
+    Dropping a table deletes the table and every row in it, and the data cannot
+    come back from MongoDB because the collection is gone. So this asks for
+    confirmation first. An automated run that means it can pass -Confirm:$false,
+    and -WhatIf shows what would happen without touching anything.
+    #>
+
+    [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'High')]
+    param (
+        $Connection,
+        [Parameter(Mandatory = $true)]
+        [string]$TableName,
+        [int]$RowCount = 0
+    )
+
+    $target = "table '$TableName' with $RowCount row(s)"
+    $action = "DROP TABLE - deletes the table and its data permanently"
+
+    if (-not $PSCmdlet.ShouldProcess($target, $action)) {
+        Write-N2SMessage " Kept table '$TableName'" -Level Info
+        return $false
+    }
+
+    try {
+        Invoke-SQLNonQuery -Connection $Connection -CommandText ('DROP TABLE IF EXISTS `' + $TableName + '`') | Out-Null
+        Write-N2SMessage " Dropped table '$TableName' ($RowCount row(s) deleted)" -Level Warning
+        return $true
+    }
+    catch {
+        Write-N2SMessage " Could not drop table '$TableName': $($_.Exception.Message)" -Level Error
+        return $false
+    }
+}
+
+function Sort-OrphanTableForDrop {
+    <#
+    .SYNOPSIS
+    Puts child tables before their parent, so a foreign key cannot block the drop
+    #>
+
+    param (
+        $Orphans
+    )
+
+    $names = @($Orphans | Select-Object -ExpandProperty Table)
+
+    return @($Orphans | Sort-Object -Property @{
+        Expression = {
+            # A table that starts with the name of another orphan is a child
+            $isChild = $false
+            foreach ($other in $names) {
+                if ($_.Table -ne $other -and $_.Table.StartsWith("${other}_")) {
+                    $isChild = $true
+                    break
+                }
+            }
+            -not $isChild
+        }
+    }, Table)
 }
 
 function Get-CollectionResultStatus {
@@ -4652,6 +4898,14 @@ function Get-CollectionResultStatus {
             $status.Success = $false
             $status.Reason = "sync reported $($syncErrors.Count) error(s): " + ($syncErrors -join '; ')
             return $status
+        }
+
+        # Things worth knowing but not failures: a field without a child table,
+        # a child table without a field
+        $syncWarnings = @($Details['Sync'].Warnings)
+
+        if ($syncWarnings.Count -gt 0) {
+            $status.Warning = "sync reported $($syncWarnings.Count) warning(s): " + ($syncWarnings -join '; ')
         }
     }
 
@@ -4764,7 +5018,10 @@ function Invoke-MigrationWorkflow {
         [int]$SampleSize = 100,
 
         [Parameter(Mandatory=$false)]
-        [switch]$Force
+        [switch]$Force,
+
+        [Parameter(Mandatory=$false)]
+        [switch]$RemoveOrphanTables
     )
 
     Write-N2SMessage "`n$('=' * 70)" -Level Header
@@ -4773,7 +5030,11 @@ function Invoke-MigrationWorkflow {
     
     # Load configuration
     $script:AppConfig = Get-AppConfig
-    
+
+    # "This table is unused" only holds when the whole database was looked at.
+    # After a run on one collection, other tables are simply none of its business.
+    $coversWholeDatabase = ($Collections.Count -eq 0)
+
     # Get collections to process
     if ($Collections.Count -eq 0) {
         Write-N2SMessage "Discovering collections..." -Level Step
@@ -4811,6 +5072,8 @@ function Invoke-MigrationWorkflow {
         TotalSuccess = 0
         TotalFailed = 0
         TotalWarnings = 0
+        OrphanTables = @()
+        OrphanTablesRemoved = @()
         # 0 = everything fine, 1 = one or more collections failed.
         # A caller in an automated environment can use this as its exit code.
         ExitCode = 0
@@ -4889,6 +5152,58 @@ function Invoke-MigrationWorkflow {
         $overallResults.Collections += $collectionResult
     }
     
+    # Tables whose collection no longer exists in MongoDB. Only worth saying
+    # after a run over the whole database, or when the caller asked for the
+    # cleanup: a run on one collection says nothing about the other tables.
+    # For a one-off check there is menu option 10.
+    if ($Operation -ne 'SchemaOnly' -and ($coversWholeDatabase -or $RemoveOrphanTables)) {
+        try {
+            $existingCollections = @(Get-MongoDBCollections)
+            $orphanConnection = Get-SQLConnectionObject -DatabaseType $DatabaseType
+            $orphanConnection.Open()
+
+            try {
+                $orphans = @(Get-OrphanSQLTable -Connection $orphanConnection -Collections $existingCollections)
+                $overallResults.OrphanTables = @($orphans | Select-Object -ExpandProperty Table)
+
+                if ($orphans.Count -gt 0) {
+                    Write-N2SMessage "`nTables without a MongoDB collection:" -Level Warning
+
+                    foreach ($orphan in $orphans) {
+                        Write-N2SMessage "  $($orphan.Table) ($($orphan.Rows) row(s))" -Level Warning
+                    }
+
+                    if ($RemoveOrphanTables) {
+                        Write-N2SMessage "  These tables and their data will be dropped permanently." -Level Warning
+
+                        foreach ($orphan in (Sort-OrphanTableForDrop -Orphans $orphans)) {
+                            try {
+                                if (Remove-OrphanSQLTable -Connection $orphanConnection -TableName $orphan.Table -RowCount $orphan.Rows) {
+                                    $overallResults.OrphanTablesRemoved += $orphan.Table
+                                }
+                            }
+                            catch {
+                                # A run without a keyboard cannot answer the
+                                # confirmation; one refusal must not stop the rest
+                                Write-N2SMessage " Kept table '$($orphan.Table)': $($_.Exception.Message)" -Level Warning
+                                Write-N2SMessage "  Use -Confirm:`$false to drop tables in an automated run" -Level Info
+                            }
+                        }
+                    }
+                    else {
+                        Write-N2SMessage "  Left untouched. Use -RemoveOrphanTables to drop them." -Level Info
+                    }
+                }
+            }
+            finally {
+                $orphanConnection.Close()
+            }
+        }
+        catch {
+            Write-N2SMessage "Warning: could not check for orphan tables: $($_.Exception.Message)" -Level Warning
+        }
+    }
+
     # Display overall summary
     $overallResults.EndTime = Get-Date
     $duration = $overallResults.EndTime - $overallResults.StartTime
@@ -5243,7 +5558,8 @@ function Start-MigrationToolMenu {
             "7" { Menu-SyncAll }
             "8" { Menu-ValidateSingle }
             "9" { Menu-SchemaOnly }
-            "0" { 
+            "10" { Menu-CleanupOrphanTables }
+            "0" {
                 Write-Host "`n Thank you for using NoSQL to SQL Migration Tool!" -ForegroundColor Cyan
                 $continue = $false 
             }
@@ -5294,6 +5610,10 @@ function Show-MainMenu {
     Write-Host "├────────────────────────────────────────────────────────────┤" -ForegroundColor DarkGray
     Write-Host "│  [8] Validate Single Collection                            │" -ForegroundColor White
     Write-Host "│  [9] Analyze Schema Only                                   │" -ForegroundColor White
+    Write-Host "│                                                            │" -ForegroundColor DarkGray
+    Write-Host "│  MAINTENANCE                                               │" -ForegroundColor Yellow
+    Write-Host "├────────────────────────────────────────────────────────────┤" -ForegroundColor DarkGray
+    Write-Host "│ [10] Clean Up Tables Without a Collection                   │" -ForegroundColor White
     Write-Host "│                                                            │" -ForegroundColor DarkGray
     Write-Host "│  [0] Exit                                                  │" -ForegroundColor Red
     Write-Host "└────────────────────────────────────────────────────────────┘" -ForegroundColor DarkGray
@@ -5563,6 +5883,109 @@ function Menu-ValidateSingle {
     }
     else {
         Write-Host "`n Invalid selection." -ForegroundColor Red
+    }
+}
+
+function Menu-CleanupOrphanTables {
+    <#
+    .SYNOPSIS
+    Menu item: show tables without a collection and offer to drop them
+
+    .DESCRIPTION
+    Asking the questions is the job of the menu, so this is where the user is
+    shown exactly what is about to be lost. The dropping itself is done by
+    Remove-OrphanSQLTable, which asks for its own confirmation per table.
+    #>
+
+    Write-Host "`n$('=' * 60)" -ForegroundColor Cyan
+    Write-Host "Clean Up Tables Without a Collection" -ForegroundColor Cyan
+    Write-Host ("="*60) -ForegroundColor Cyan
+
+    $collections = @(Get-MongoDBCollections)
+
+    if ($collections.Count -eq 0) {
+        Write-Host "`nNo collections found in MongoDB." -ForegroundColor Yellow
+        Write-Host "Stopping: without that list every table would look unused." -ForegroundColor Yellow
+        return
+    }
+
+    $connection = $null
+
+    try {
+        $connection = Get-SQLConnectionObject -DatabaseType "MySQL"
+        $connection.Open()
+
+        $orphans = @(Get-OrphanSQLTable -Connection $connection -Collections $collections)
+
+        # Second kind: the collection still exists, but a field that had its own
+        # child table is gone from every document. Reading all documents is the
+        # only way to be sure, and being sure matters before dropping anything.
+        Write-Host "`nChecking the child tables of each collection..." -ForegroundColor Gray
+
+
+        foreach ($collectionName in $collections) {
+            Connect-Mdbc -ConnectionString $script:AppConfig.MongoDB.ConnectionString `
+                         -DatabaseName $script:AppConfig.MongoDB.Database `
+                         -CollectionName $collectionName
+
+            $documents = @(Get-MdbcData)
+
+            foreach ($ghost in (Get-GhostChildTable -Connection $connection -TableName $collectionName -Documents $documents)) {
+                $orphans += [PSCustomObject]@{
+                    Table = $ghost.Table
+                    Rows  = $ghost.Rows
+                    Field = $ghost.Field
+                }
+            }
+        }
+
+        if ($orphans.Count -eq 0) {
+            Write-Host "`nEvery table still has something behind it in MongoDB. Nothing to clean up." -ForegroundColor Green
+            return
+        }
+
+        Write-Host "`nThese tables have nothing behind them in MongoDB anymore:" -ForegroundColor Yellow
+
+        foreach ($orphan in $orphans) {
+            Write-Host "  $($orphan.Table)" -NoNewline -ForegroundColor White
+            Write-Host " - $($orphan.Rows) row(s)" -NoNewline -ForegroundColor Gray
+
+            if ($orphan.PSObject.Properties.Name -contains 'Field' -and $orphan.Field) {
+                Write-Host " (field '$($orphan.Field)' no longer exists)" -ForegroundColor DarkGray
+            }
+            else {
+                Write-Host " (collection is gone)" -ForegroundColor DarkGray
+            }
+        }
+
+        Write-Host "`nDropping a table deletes the table and every row in it." -ForegroundColor Red
+        Write-Host "The data cannot be restored, because what it described no longer exists in MongoDB." -ForegroundColor Red
+
+        $answer = Read-Host "`nDrop these tables? Type YES to continue"
+
+        if ($answer -ne 'YES') {
+            Write-Host "`nNothing was dropped." -ForegroundColor Green
+            return
+        }
+
+        # Child tables first, so a foreign key cannot block the drop
+        $dropped = 0
+
+        foreach ($orphan in (Sort-OrphanTableForDrop -Orphans $orphans)) {
+            if (Remove-OrphanSQLTable -Connection $connection -TableName $orphan.Table -RowCount $orphan.Rows) {
+                $dropped++
+            }
+        }
+
+        Write-Host "`nDropped $dropped of $($orphans.Count) table(s)." -ForegroundColor Yellow
+    }
+    catch {
+        Write-Host "`nCleanup failed: $($_.Exception.Message)" -ForegroundColor Red
+    }
+    finally {
+        if ($connection -and $connection.State -eq 'Open') {
+            $connection.Close()
+        }
     }
 }
 
