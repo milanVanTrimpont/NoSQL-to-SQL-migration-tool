@@ -5190,6 +5190,14 @@ function Invoke-N2SMigration {
     there is nobody to answer a confirmation, so giving this switch counts as the
     confirmation itself.
 
+    .PARAMETER AllowEmptySource
+    Allow a full migration of a collection that holds no documents. Such a run
+    empties the table and drops its columns and child tables with it, because
+    without documents there is no schema to derive. It is refused without this
+    switch, since an empty collection cannot be told apart from a wrong collection
+    name or a wrong database. An IncrementalSync deletes the rows of removed
+    documents without this switch, and keeps the tables.
+
     .OUTPUTS
     The workflow result, including ExitCode (0 = fine, 1 = a collection failed).
 
@@ -5670,7 +5678,17 @@ function Invoke-MigrationWorkflow {
     
     .PARAMETER SampleSize
     Number of documents to sample for schema analysis
-    
+
+    .PARAMETER Force
+    Skip the confirmation before a full migration overwrites existing tables.
+
+    .PARAMETER RemoveOrphanTables
+    Drop tables whose collection no longer exists instead of only reporting them.
+
+    .PARAMETER AllowEmptySource
+    Allow a full migration of a collection without documents, which empties the
+    table and drops its columns and child tables. Refused without this switch.
+
     .EXAMPLE
     # Migrate specific collections
     Invoke-MigrationWorkflow -Collections @("klanten", "producten") -Operation FullMigration

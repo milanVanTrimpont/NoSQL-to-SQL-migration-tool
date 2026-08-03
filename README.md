@@ -280,6 +280,51 @@ reason and the action taken. Nothing disappears without a trace.
 
 ---
 
+## When a collection is emptied in MongoDB
+
+MongoDB decides: a row whose document no longer exists has to go. An **incremental
+sync** does exactly that, and it is the route meant for it — it deletes those rows
+and their child rows, reports how many, and leaves the columns and the child tables
+standing:
+
+```powershell
+pwsh -File .\Start-Migration.ps1 -Collections stresstest -Operation IncrementalSync
+```
+
+A **full migration** of a collection that holds no documents at all is a different
+matter, and it is refused:
+
+```
+Collection 'stresstest' holds no documents while table 'stresstest' holds 1000 row(s).
+```
+
+Without documents there is nothing to derive a schema from, so such a run drops not
+only the rows but the columns and the child tables as well, and leaves a table with
+nothing in it but an `_id`. And that situation looks exactly like a typo in the
+collection name, the wrong database in `config.json`, or a MongoDB that has not been
+filled yet. So the run stops, says which of the two routes you probably want, and
+ends with exit code 1 — the table is untouched.
+
+Do you really mean to rebuild the table empty? Then say so:
+
+```powershell
+pwsh -File .\Start-Migration.ps1 -Collections stresstest -Operation FullMigration -AllowEmptySource
+```
+
+| Route | Rows | Columns and child tables | Reports |
+|---|---|---|---|
+| `IncrementalSync` | gone | kept | `Deleted Records: n` |
+| `FullMigration` | untouched | untouched | exit code 1 with an explanation |
+| `FullMigration -AllowEmptySource` | gone | gone | a warning naming the switch |
+
+An empty collection whose table is empty too needs no switch: there is nothing to
+lose there, and a warning in the log is enough.
+
+The interactive menu has no override — option 3 or 5 on an emptied collection runs
+into the same refusal. Use the command line for that, or let a sync do the deleting.
+
+---
+
 ## Speed, and why it is built this way
 
 Rows are not written one at a time. Per batch of documents the tool opens one

@@ -31,6 +31,13 @@ Configuration file to use. Defaults to config.json next to this script.
 .PARAMETER Quiet
 Only report warnings and errors.
 
+.PARAMETER AllowEmptySource
+Allow a full migration of a collection that holds no documents, which empties the
+table and drops its columns and child tables. Without this switch that run is
+refused, because an empty collection is indistinguishable from a wrong collection
+name or a wrong database. A sync deletes the rows of removed documents without
+this switch, and keeps the tables.
+
 .EXAMPLE
 # Daily sync of every collection
 pwsh -File .\Start-Migration.ps1 -Operation IncrementalSync
@@ -54,7 +61,9 @@ param (
 
     [string]$ConfigPath,
 
-    [switch]$Quiet
+    [switch]$Quiet,
+
+    [switch]$AllowEmptySource
 )
 
 # Not 'Stop': an error written by the module would otherwise terminate this
@@ -72,11 +81,12 @@ try {
     Import-Module $modulePath -Force -ErrorAction Stop
 
     $arguments = @{
-        Collections  = $Collections
-        Operation    = $Operation
-        DatabaseType = $DatabaseType
-        SampleSize   = $SampleSize
-        Quiet        = $Quiet
+        Collections      = $Collections
+        Operation        = $Operation
+        DatabaseType     = $DatabaseType
+        SampleSize       = $SampleSize
+        Quiet            = $Quiet
+        AllowEmptySource = $AllowEmptySource
     }
 
     if ($ConfigPath) {
