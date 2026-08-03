@@ -211,11 +211,33 @@ Describe "Remove-OrphanSQLTable" {
         InModuleScope NoSqlToSqlMigration -Parameters @{ Connection = $connection } {
             param($Connection)
 
-            Remove-OrphanSQLTable -Connection $Connection -TableName "users" -RowCount 1 -Confirm:$false |
-                Should -BeTrue
+            $tables = @([PSCustomObject]@{ Table = "users"; Rows = 1 })
+
+            @(Remove-OrphanSQLTable -Connection $Connection -Tables $tables -Confirm:$false) |
+                Should -Be @("users")
         }
 
         $connection.Dropped -join ' ' | Should -Match 'DROP TABLE IF EXISTS `users`'
+    }
+
+    It "handles every table in one call, so Yes to All really means all" {
+        # PowerShell remembers Yes to All per invocation. Calling this once per
+        # table would ask again for each one, however the user answered.
+        $connection = New-TableListConnection -Tables @("users", "users_roles")
+
+        InModuleScope NoSqlToSqlMigration -Parameters @{ Connection = $connection } {
+            param($Connection)
+
+            $tables = @(
+                [PSCustomObject]@{ Table = "users_roles"; Rows = 3 }
+                [PSCustomObject]@{ Table = "users"; Rows = 1 }
+            )
+
+            @(Remove-OrphanSQLTable -Connection $Connection -Tables $tables -Confirm:$false).Count |
+                Should -Be 2
+        }
+
+        $connection.Dropped.Count | Should -Be 2
     }
 
     It "drops nothing in WhatIf mode" {
@@ -224,15 +246,17 @@ Describe "Remove-OrphanSQLTable" {
         InModuleScope NoSqlToSqlMigration -Parameters @{ Connection = $connection } {
             param($Connection)
 
-            Remove-OrphanSQLTable -Connection $Connection -TableName "users" -RowCount 1 -WhatIf |
-                Should -BeFalse
+            $tables = @([PSCustomObject]@{ Table = "users"; Rows = 1 })
+
+            @(Remove-OrphanSQLTable -Connection $Connection -Tables $tables -WhatIf).Count |
+                Should -Be 0
         }
 
         $connection.Dropped.Count | Should -Be 0
     }
 
-    It "names the table and the row count in what it asks" {
-        # The question has to say what is about to be lost
+    It "supports WhatIf and Confirm" {
+        # The question has to be answerable, and skippable in an automated run
         InModuleScope NoSqlToSqlMigration {
             $command = Get-Command Remove-OrphanSQLTable
             $command.Parameters.ContainsKey('WhatIf') | Should -BeTrue

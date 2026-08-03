@@ -5444,40 +5444,66 @@ function Get-GhostChildTable {
 function Remove-OrphanSQLTable {
     <#
     .SYNOPSIS
-    Drops one orphan table, after confirmation
+    Drops orphan tables, after confirmation
 
     .DESCRIPTION
     Dropping a table deletes the table and every row in it, and the data cannot
-    come back from MongoDB because the collection is gone. So this asks for
-    confirmation first. An automated run that means it can pass -Confirm:$false,
+    come back from MongoDB because what it described is gone. So this asks for
+    confirmation per table. An automated run that means it can pass -Confirm:$false,
     and -WhatIf shows what would happen without touching anything.
+
+    All tables are handled in one call on purpose. PowerShell remembers "Yes to
+    All" per invocation, so a loop that calls this once per table would ask again
+    for every table however often the user answered "all".
+
+    .PARAMETER Tables
+    The tables to drop: objects with a Table and a Rows property, or plain names.
+    Pass them in drop order, see Get-OrphanTableDropOrder.
+
+    .OUTPUTS
+    The names of the tables that were actually dropped.
     #>
 
     [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'High')]
     param (
         $Connection,
         [Parameter(Mandatory = $true)]
-        [string]$TableName,
-        [int]$RowCount = 0
+        $Tables
     )
 
-    $target = "table '$TableName' with $RowCount row(s)"
+    $dropped = @()
     $action = "DROP TABLE - deletes the table and its data permanently"
 
-    if (-not $PSCmdlet.ShouldProcess($target, $action)) {
-        Write-N2SMessage " Kept table '$TableName'" -Level Info
-        return $false
+    foreach ($table in @($Tables)) {
+        if ($table -is [string]) {
+            $name = $table
+            $rows = 0
+        }
+        else {
+            $name = $table.Table
+            $rows = [int]$table.Rows
+        }
+
+        if ([string]::IsNullOrWhiteSpace($name)) {
+            continue
+        }
+
+        if (-not $PSCmdlet.ShouldProcess("table '$name' with $rows row(s)", $action)) {
+            Write-N2SMessage " Kept table '$name'" -Level Info
+            continue
+        }
+
+        try {
+            Invoke-SQLNonQuery -Connection $Connection -CommandText ('DROP TABLE IF EXISTS `' + $name + '`') | Out-Null
+            Write-N2SMessage " Dropped table '$name' ($rows row(s) deleted)" -Level Warning
+            $dropped += $name
+        }
+        catch {
+            Write-N2SMessage " Could not drop table '$name': $($_.Exception.Message)" -Level Error
+        }
     }
 
-    try {
-        Invoke-SQLNonQuery -Connection $Connection -CommandText ('DROP TABLE IF EXISTS `' + $TableName + '`') | Out-Null
-        Write-N2SMessage " Dropped table '$TableName' ($RowCount row(s) deleted)" -Level Warning
-        return $true
-    }
-    catch {
-        Write-N2SMessage " Could not drop table '$TableName': $($_.Exception.Message)" -Level Error
-        return $false
-    }
+    return $dropped
 }
 
 function Get-OrphanTableDropOrder {
@@ -5822,18 +5848,16 @@ function Invoke-MigrationWorkflow {
                     if ($RemoveOrphanTables) {
                         Write-N2SMessage "  These tables and their data will be dropped permanently." -Level Warning
 
-                        foreach ($orphan in (Get-OrphanTableDropOrder -Orphans $orphans)) {
-                            try {
-                                if (Remove-OrphanSQLTable -Connection $orphanConnection -TableName $orphan.Table -RowCount $orphan.Rows) {
-                                    $overallResults.OrphanTablesRemoved += $orphan.Table
-                                }
-                            }
-                            catch {
-                                # A run without a keyboard cannot answer the
-                                # confirmation; one refusal must not stop the rest
-                                Write-N2SMessage " Kept table '$($orphan.Table)': $($_.Exception.Message)" -Level Warning
-                                Write-N2SMessage "  Use -Confirm:`$false to drop tables in an automated run" -Level Info
-                            }
+                        try {
+                            $overallResults.OrphanTablesRemoved += @(
+                                Remove-OrphanSQLTable -Connection $orphanConnection `
+                                                      -Tables (Get-OrphanTableDropOrder -Orphans $orphans)
+                            )
+                        }
+                        catch {
+                            # A run without a keyboard cannot answer the confirmation
+                            Write-N2SMessage " Tables were kept: $($_.Exception.Message)" -Level Warning
+                            Write-N2SMessage "  Use -Confirm:`$false to drop tables in an automated run" -Level Info
                         }
                     }
                     else {
@@ -6681,16 +6705,12 @@ function Menu-CleanupOrphanTables {
             return
         }
 
-        # Child tables first, so a foreign key cannot block the drop
-        $dropped = 0
+        # One call for all of them, child tables first so a foreign key cannot
+        # block the drop. One call also means "Yes to All" really means all.
+        $dropped = @(Remove-OrphanSQLTable -Connection $connection `
+                                           -Tables (Get-OrphanTableDropOrder -Orphans $orphans))
 
-        foreach ($orphan in (Get-OrphanTableDropOrder -Orphans $orphans)) {
-            if (Remove-OrphanSQLTable -Connection $connection -TableName $orphan.Table -RowCount $orphan.Rows) {
-                $dropped++
-            }
-        }
-
-        Write-Host "`nDropped $dropped of $($orphans.Count) table(s)." -ForegroundColor Yellow
+        Write-Host "`nDropped $($dropped.Count) of $($orphans.Count) table(s)." -ForegroundColor Yellow
     }
     catch {
         Write-Host "`nCleanup failed: $($_.Exception.Message)" -ForegroundColor Red
