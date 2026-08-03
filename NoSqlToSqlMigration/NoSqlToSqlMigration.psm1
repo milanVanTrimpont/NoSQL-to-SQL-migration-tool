@@ -889,16 +889,20 @@ To ensure that all database connections are correctly configured and operational
     Write-N2SMessage "    Data Migration - MongoDB to $DatabaseType" -Level Header
     Write-N2SMessage "═══════════════════════════════════════════════════════`n" -Level Header
     
-    # Initialize migration tracking
-    $migrationResult = @{
+    # Initialize migration tracking. Ordered, so the fields always print in the
+    # same sensible order instead of the arbitrary order of a hashtable.
+    $migrationResult = [ordered]@{
+        StartTime = Get-Date
+        EndTime = $null
+        Duration = $null
+        DurationSeconds = 0
         TotalDocuments = 0
         MigratedDocuments = 0
         FailedDocuments = 0
-        Errors = @()
-        StartTime = Get-Date
         TablesCreated = @()
         RecordsInserted = @{}
         ConversionIssues = @()
+        Errors = @()
     }
     
     try {
@@ -989,8 +993,8 @@ To ensure that all database connections are correctly configured and operational
             $documents = Get-MdbcData -Skip $processedCount -First $BatchSize
 
             # Collect the rows of this batch and write them together: one round trip
-            # per statement instead of per row is what makes a large migration
-            # finish in minutes rather than hours
+            # per statement instead of per row. Measured on 9.900 rows: 48 seconds
+            # became 8, of which about 1 second is the database itself.
             Start-SQLRowBuffer
             $transaction = $sqlConnection.BeginTransaction()
 
@@ -1088,11 +1092,13 @@ To ensure that all database connections are correctly configured and operational
         # Step 4: Summary
         $migrationResult.EndTime = Get-Date
         $duration = $migrationResult.EndTime - $migrationResult.StartTime
+        $migrationResult.Duration = $duration.ToString('hh\:mm\:ss')
+        $migrationResult.DurationSeconds = [math]::Round($duration.TotalSeconds, 2)
 
         Write-N2SMessage "`n═══════════════════════════════════════════════════════" -Level Header
         Write-N2SMessage "Migration Complete!" -Level Success
         Write-N2SMessage "═══════════════════════════════════════════════════════" -Level Header
-        Write-N2SMessage "Duration: $($duration.TotalSeconds) seconds" -Level Detail
+        Write-N2SMessage "Duration: $($migrationResult.Duration) ($($migrationResult.DurationSeconds) seconds)" -Level Detail
         Write-N2SMessage "Total documents: $($migrationResult.TotalDocuments)" -Level Detail
         Write-N2SMessage "Successfully migrated: $($migrationResult.MigratedDocuments)" -Level Success
         Write-N2SMessage "Failed: $($migrationResult.FailedDocuments)" -Level $(if ($migrationResult.FailedDocuments -gt 0) { 'Error' } else { 'Detail' })
@@ -1430,8 +1436,8 @@ function ConvertTo-SQLColumnValue {
     $column = Get-SQLColumnKind -ColumnType $ColumnType
 
     # Most values already have the type their column wants. Handing those straight
-    # through skips the whole conversion chain, which is what makes the difference
-    # on tens of thousands of rows.
+    # through skips the rest of this function: measured about a third faster per
+    # value. On a whole migration that is a modest gain, not the decisive one.
     switch ($column.Kind) {
         'int' {
             if ($Value -is [int] -or $Value -is [long]) { $result.Value = $Value; return $result }
@@ -1633,10 +1639,10 @@ function Start-SQLRowBuffer {
     Starts collecting rows instead of writing them one at a time
 
     .DESCRIPTION
-    Writing row by row costs one round trip to the database per row, and that is
-    where nearly all the time of a migration goes: measured on a local MySQL,
-    row by row does about 200 rows per second, while rows collected into
-    multi-row statements inside one transaction do more than 11,000.
+    Writing row by row costs one round trip to the database per row, and that used
+    to be where nearly all the time of a migration went: measured on a local
+    MySQL, row by row does about 200 rows per second, while rows collected into
+    multi-row statements inside one transaction do more than 11,000. 
 
     While the buffer is active, Add-SQLRow and Invoke-ChildTableMigration write
     nothing; Invoke-SQLRowBufferFlush sends everything in as few statements as
@@ -3702,21 +3708,24 @@ function Start-IncrementalSync {
     Write-N2SMessage "═══════════════════════════════════════════════════════`n" -Level Header
     
     # Initialize sync result
-    $syncResult = @{
-        SyncTime = Get-Date
+    $syncResult = [ordered]@{
         TableName = $TableName
+        IsFullSync = $ForceFullSync.IsPresent
+        LastSyncTime = $null
+        SyncTime = Get-Date
+        EndTime = $null
+        Duration = $null
+        DurationSeconds = 0
+        TotalProcessed = 0
         NewRecords = 0
         UpdatedRecords = 0
         DeletedRecords = 0
         UnchangedRecords = 0
-        TotalProcessed = 0
         RepairedChildRecords = 0
         ChildRecords = @{}
         GhostChildTables = @()
-        Errors = @()
         Warnings = @()
-        LastSyncTime = $null
-        IsFullSync = $ForceFullSync.IsPresent
+        Errors = @()
     }
 
     # Table layout is read back from the database while writing rows
@@ -4075,11 +4084,18 @@ function Start-IncrementalSync {
             }
         }
 
+        # How long the whole sync took, so a slow run can be compared with a fast one
+        $syncResult.EndTime = Get-Date
+        $syncDuration = $syncResult.EndTime - $syncResult.SyncTime
+        $syncResult.Duration = $syncDuration.ToString('hh\:mm\:ss')
+        $syncResult.DurationSeconds = [math]::Round($syncDuration.TotalSeconds, 2)
+
         # Display summary
         Write-N2SMessage "`n═══════════════════════════════════════════════════════" -Level Header
         Write-N2SMessage "Sync Complete!" -Level Success
         Write-N2SMessage "═══════════════════════════════════════════════════════" -Level Header
         Write-N2SMessage "Sync Type: $(if ($syncResult.IsFullSync) { 'FULL' } else { 'INCREMENTAL' })" -Level Detail
+        Write-N2SMessage "Duration: $($syncResult.Duration) ($($syncResult.DurationSeconds) seconds)" -Level Detail
         Write-N2SMessage "Total Processed: $($syncResult.TotalProcessed)" -Level Detail
         Write-N2SMessage "New Records: $($syncResult.NewRecords)" -Level Success
         Write-N2SMessage "Updated Records: $($syncResult.UpdatedRecords)" -Level Step
@@ -4185,6 +4201,107 @@ function Save-SyncState {
     }
 }
 
+function Add-HashableString {
+    <#
+    .SYNOPSIS
+    Appends the text form of a value to a StringBuilder
+
+    .DESCRIPTION
+    This is the fallback route, for values that cannot hand over their own BSON:
+    a hashtable built in a test, or a PSCustomObject. Documents that come from
+    MongoDB are hashed from their BSON bytes in Get-DocumentHash instead.
+
+    Writing into one buffer avoids joining strings per level, but that is not
+    where the time goes. On a large document the cost is one function call per
+    value, tens of thousands of them, and no amount of string tuning fixes that.
+    That is exactly why this route is only the fallback.
+    #>
+
+    param (
+        $Value,
+        [System.Text.StringBuilder]$Builder
+    )
+
+    if ($null -eq $Value) {
+        [void]$Builder.Append('null')
+        return
+    }
+    # The checks are inline and ordered by how often they occur. Calling a helper
+    # per value, or sorting keys with Sort-Object, costs a cmdlet call per node,
+    # and a document with a few hundred sub-documents has tens of thousands.
+    if ($Value -is [System.Collections.IDictionary]) {
+        [void]$Builder.Append('{')
+
+        # Keys sorted, so the same content always gives the same text
+        $keys = [string[]]@($Value.Keys)
+        [Array]::Sort($keys, [System.StringComparer]::OrdinalIgnoreCase)
+
+        $first = $true
+        foreach ($key in $keys) {
+            if (-not $first) { [void]$Builder.Append(';') }
+            $first = $false
+
+            [void]$Builder.Append($key).Append('=')
+            Add-HashableString -Value $Value[$key] -Builder $Builder
+        }
+
+        [void]$Builder.Append('}')
+        return
+    }
+
+    if ($Value -is [string]) {
+        [void]$Builder.Append($Value)
+        return
+    }
+
+    if ($Value -is [double] -or $Value -is [float] -or $Value -is [decimal]) {
+        [void]$Builder.Append(([double]$Value).ToString([System.Globalization.CultureInfo]::InvariantCulture))
+        return
+    }
+
+    if ($Value -is [DateTime]) {
+        [void]$Builder.Append($Value.ToString("o", [System.Globalization.CultureInfo]::InvariantCulture))
+        return
+    }
+
+    if ($Value -is [System.Collections.IEnumerable]) {
+        # Element order is part of the content: reordering an array is a change
+        [void]$Builder.Append('[')
+
+        $first = $true
+        foreach ($item in $Value) {
+            if (-not $first) { [void]$Builder.Append(';') }
+            $first = $false
+
+            Add-HashableString -Value $item -Builder $Builder
+        }
+
+        [void]$Builder.Append(']')
+        return
+    }
+
+    if ($null -ne $Value.PSObject -and $Value.PSObject.BaseObject -is [System.Management.Automation.PSCustomObject]) {
+        [void]$Builder.Append('{')
+
+        $names = [string[]]@($Value.PSObject.Properties.Name)
+        [Array]::Sort($names, [System.StringComparer]::OrdinalIgnoreCase)
+
+        $first = $true
+        foreach ($name in $names) {
+            if (-not $first) { [void]$Builder.Append(';') }
+            $first = $false
+
+            [void]$Builder.Append($name).Append('=')
+            Add-HashableString -Value $Value.PSObject.Properties[$name].Value -Builder $Builder
+        }
+
+        [void]$Builder.Append('}')
+        return
+    }
+
+    [void]$Builder.Append($Value.ToString())
+}
+
 function ConvertTo-HashableString {
     <#
     .SYNOPSIS
@@ -4194,52 +4311,19 @@ function ConvertTo-HashableString {
     Keys are sorted so the same content always produces the same text. Numbers and
     dates are written culture independent, otherwise the same value would hash
     differently depending on the regional settings of the machine.
+
+    Used by Get-DocumentHash for values that are not MongoDB documents, and handy
+    on its own to see what a document looks like to the change detection.
     #>
 
     param (
         $Value
     )
 
-    if ($null -eq $Value) {
-        return "null"
-    }
+    $builder = [System.Text.StringBuilder]::new()
+    Add-HashableString -Value $Value -Builder $builder
 
-    if (Test-IsDocumentObject -Value $Value) {
-        $parts = @()
-
-        if ($Value -is [System.Collections.IDictionary]) {
-            foreach ($key in ($Value.Keys | Sort-Object)) {
-                $parts += "$key=" + (ConvertTo-HashableString -Value $Value[$key])
-            }
-        }
-        else {
-            foreach ($property in ($Value.PSObject.Properties | Sort-Object Name)) {
-                $parts += "$($property.Name)=" + (ConvertTo-HashableString -Value $property.Value)
-            }
-        }
-
-        return "{" + ($parts -join ";") + "}"
-    }
-
-    if ($Value -is [System.Collections.IEnumerable] -and $Value -isnot [string]) {
-        # Element order is part of the content: reordering an array is a change
-        $parts = @()
-        foreach ($item in $Value) {
-            $parts += ConvertTo-HashableString -Value $item
-        }
-
-        return "[" + ($parts -join ";") + "]"
-    }
-
-    if ($Value -is [double] -or $Value -is [float] -or $Value -is [decimal]) {
-        return ([double]$Value).ToString([System.Globalization.CultureInfo]::InvariantCulture)
-    }
-
-    if ($Value -is [DateTime]) {
-        return $Value.ToString("o", [System.Globalization.CultureInfo]::InvariantCulture)
-    }
-
-    return $Value.ToString()
+    return $builder.ToString()
 }
 
 function Get-DocumentHash {
@@ -4251,6 +4335,12 @@ function Get-DocumentHash {
     Covers the whole document, including arrays and sub-documents. Hashing only
     the scalar fields would hide a changed array, so a document whose ratings
     changed would never be flagged for sync.
+
+    A document that comes from MongoDB can hand over its own BSON, and hashing
+    those bytes is native work. Walking every value from PowerShell costs a
+    function call per value: on a document with a few hundred sub-documents that
+    took fifteen seconds, against a fraction of a second now. Anything else, such
+    as a hashtable built in a test, still takes the text route.
     #>
 
     param (
@@ -4258,15 +4348,30 @@ function Get-DocumentHash {
     )
 
     try {
-        $content = ConvertTo-HashableString -Value $Document
+        $bytes = $null
 
-        # Calculate MD5 hash
+        if ($null -ne $Document -and $null -ne $Document.PSObject.Methods['ToBsonDocument']) {
+            $bson = $Document.ToBsonDocument()
+
+            try {
+                # Fastest: the raw bytes, without a large string in between
+                $bytes = [MongoDB.Bson.BsonExtensionMethods]::ToBson[MongoDB.Bson.BsonDocument]($bson)
+            }
+            catch {
+                # Calling a generic method this way needs a recent PowerShell, so
+                # fall back to the JSON form of the same document
+                $bytes = [System.Text.Encoding]::UTF8.GetBytes($bson.ToString())
+            }
+        }
+
+        if ($null -eq $bytes) {
+            $bytes = [System.Text.Encoding]::UTF8.GetBytes((ConvertTo-HashableString -Value $Document))
+        }
+
         $md5 = [System.Security.Cryptography.MD5]::Create()
-        $bytes = [System.Text.Encoding]::UTF8.GetBytes($content)
-        $hashBytes = $md5.ComputeHash($bytes)
-        $hash = [System.BitConverter]::ToString($hashBytes).Replace("-", "")
+        $hashBytes = $md5.ComputeHash([byte[]]$bytes)
 
-        return $hash
+        return [System.BitConverter]::ToString($hashBytes).Replace("-", "")
     }
     catch {
         Write-N2SMessage "Warning: Could not calculate hash for document" -Level Step
@@ -4459,8 +4564,9 @@ function Sync-DocumentChildTables {
         $hasField = ($Document.Keys -contains $fieldName -and $null -ne $Document[$fieldName])
 
         # Nothing in the document and nothing in the table for this parent means
-        # there is nothing to clear and nothing to write. Skipping that saves a
-        # call per child table per document, which adds up over a whole sync.
+        # there is nothing to clear and nothing to write. This only helps for
+        # documents that lack the field; where every document fills every child
+        # field there is nothing to skip and it changes nothing.
         if (-not $hasField -and $null -ne $ChildRowCounts -and $ChildRowCounts.ContainsKey($fieldName)) {
             $existingRows = 0
 
@@ -5600,14 +5706,18 @@ function Invoke-MigrationWorkflow {
     Write-N2SMessage "Database Type: $DatabaseType" -Level Header
     Write-N2SMessage "" -Level Info
     
-    # Overall results
-    $overallResults = @{
+    # Overall results. Ordered, so the fields always print in a sensible order:
+    # a plain hashtable has no order and showed EndTime before StartTime.
+    $overallResults = [ordered]@{
         Operation = $Operation
         StartTime = Get-Date
+        EndTime = $null
+        Duration = $null
+        DurationSeconds = 0
         Collections = @()
         TotalSuccess = 0
-        TotalFailed = 0
         TotalWarnings = 0
+        TotalFailed = 0
         OrphanTables = @()
         OrphanTablesRemoved = @()
         # 0 = everything fine, 1 = one or more collections failed.
@@ -5743,11 +5853,13 @@ function Invoke-MigrationWorkflow {
     # Display overall summary
     $overallResults.EndTime = Get-Date
     $duration = $overallResults.EndTime - $overallResults.StartTime
-    
+    $overallResults.Duration = $duration.ToString('hh\:mm\:ss')
+    $overallResults.DurationSeconds = [math]::Round($duration.TotalSeconds, 2)
+
     Write-N2SMessage "`n$('=' * 70)" -Level Header
     Write-N2SMessage "Overall Summary" -Level Header
     Write-N2SMessage ("="*70) -Level Header
-    Write-N2SMessage "Duration: $($duration.TotalSeconds) seconds" -Level Detail
+    Write-N2SMessage "Duration: $($overallResults.Duration) ($($overallResults.DurationSeconds) seconds)" -Level Detail
     Write-N2SMessage "Collections Processed: $($Collections.Count)" -Level Detail
     # An automated caller should be able to act on this without reading output
     if ($overallResults.TotalFailed -gt 0) {
