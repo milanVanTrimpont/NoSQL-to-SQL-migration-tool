@@ -299,13 +299,13 @@ Describe "Invoke-DocumentMigration" {
     }
 }
 
-Describe "Normalize-ValueForComparison" {
+Describe "ConvertTo-ComparableValue" {
 
     It "compares numbers by value, not by notation" {
         # MySQL returns DECIMAL(18,2) as 8.30 where MongoDB holds 8.3
         InModuleScope NoSqlToSqlMigration {
-            $mongo = Normalize-ValueForComparison -Value 8.3 -DatabaseType "MySQL"
-            $sql = Normalize-ValueForComparison -Value ([decimal]8.30) -DatabaseType "MySQL"
+            $mongo = ConvertTo-ComparableValue -Value 8.3 -DatabaseType "MySQL"
+            $sql = ConvertTo-ComparableValue -Value ([decimal]8.30) -DatabaseType "MySQL"
 
             $mongo | Should -Be $sql
         }
@@ -313,13 +313,13 @@ Describe "Normalize-ValueForComparison" {
 
     It "turns a boolean into 1" {
         InModuleScope NoSqlToSqlMigration {
-            Normalize-ValueForComparison -Value $true -DatabaseType "MySQL" | Should -Be "1"
+            ConvertTo-ComparableValue -Value $true -DatabaseType "MySQL" | Should -Be "1"
         }
     }
 
     It "turns null into an empty string" {
         InModuleScope NoSqlToSqlMigration {
-            Normalize-ValueForComparison -Value $null -DatabaseType "MySQL" | Should -Be ""
+            ConvertTo-ComparableValue -Value $null -DatabaseType "MySQL" | Should -Be ""
         }
     }
 }

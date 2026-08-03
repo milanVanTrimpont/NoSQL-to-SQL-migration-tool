@@ -81,12 +81,12 @@ Describe "Test-IsDocumentObject" {
     }
 }
 
-Describe "Analyze-DocumentStructure" {
+Describe "Add-DocumentToSchema" {
 
     It "records a scalar field with its type" {
         InModuleScope NoSqlToSqlMigration {
             $schema = @{}
-            Analyze-DocumentStructure -Document @{ title = "Heat" } -Schema $schema -TotalDocs 1
+            Add-DocumentToSchema -Document @{ title = "Heat" } -Schema $schema -TotalDocs 1
 
             $schema.ContainsKey('title') | Should -BeTrue
             $schema['title'].Types['string'] | Should -Be 1
@@ -101,7 +101,7 @@ Describe "Analyze-DocumentStructure" {
         InModuleScope NoSqlToSqlMigration {
             $schema = @{}
             $long = "x" * 400
-            Analyze-DocumentStructure -Document @{ storyline = $long } -Schema $schema -TotalDocs 1
+            Add-DocumentToSchema -Document @{ storyline = $long } -Schema $schema -TotalDocs 1
 
             $schema['storyline'].MaxLength | Should -Be 400
         }
@@ -110,7 +110,7 @@ Describe "Analyze-DocumentStructure" {
     It "marks an array field and counts its element types" {
         InModuleScope NoSqlToSqlMigration {
             $schema = @{}
-            Analyze-DocumentStructure -Document @{ genres = @("Drama", "Crime") } -Schema $schema -TotalDocs 1
+            Add-DocumentToSchema -Document @{ genres = @("Drama", "Crime") } -Schema $schema -TotalDocs 1
 
             $schema['genres'].IsArray | Should -BeTrue
             $schema['genres'].ArrayElementTypes['string'] | Should -Be 2
@@ -120,7 +120,7 @@ Describe "Analyze-DocumentStructure" {
     It "marks a sub-document as nested and analyses its fields" {
         InModuleScope NoSqlToSqlMigration {
             $schema = @{}
-            Analyze-DocumentStructure -Document @{ address = @{ city = "Gent" } } -Schema $schema -TotalDocs 1
+            Add-DocumentToSchema -Document @{ address = @{ city = "Gent" } } -Schema $schema -TotalDocs 1
 
             $schema['address'].IsNested | Should -BeTrue
             $schema['address'].IsArray | Should -BeFalse
@@ -132,7 +132,7 @@ Describe "Analyze-DocumentStructure" {
         InModuleScope NoSqlToSqlMigration {
             $schema = @{}
             $document = @{ reviews = @(@{ reviewer = "Ann"; rating = 9 }) }
-            Analyze-DocumentStructure -Document $document -Schema $schema -TotalDocs 1
+            Add-DocumentToSchema -Document $document -Schema $schema -TotalDocs 1
 
             $schema['reviews'].IsArray | Should -BeTrue
             $schema.ContainsKey('reviews[].reviewer') | Should -BeTrue
@@ -142,8 +142,8 @@ Describe "Analyze-DocumentStructure" {
     It "counts both types when a field is a date in one document and text in another" {
         InModuleScope NoSqlToSqlMigration {
             $schema = @{}
-            Analyze-DocumentStructure -Document @{ created = [datetime]"2020-01-02" } -Schema $schema -TotalDocs 2
-            Analyze-DocumentStructure -Document @{ created = "06/05/2022" } -Schema $schema -TotalDocs 2
+            Add-DocumentToSchema -Document @{ created = [datetime]"2020-01-02" } -Schema $schema -TotalDocs 2
+            Add-DocumentToSchema -Document @{ created = "06/05/2022" } -Schema $schema -TotalDocs 2
 
             $schema['created'].Types['datetime'] | Should -Be 1
             $schema['created'].Types['string'] | Should -Be 1

@@ -159,7 +159,7 @@ function Get-MongoDBSchema {
                 $doc = [MongoDB.Bson.BsonTypeMapper]::MapToDotNetValue($doc)
             }
             
-            Analyze-DocumentStructure -Document $doc -Schema $schema -Path "" -TotalDocs $actualSampleSize
+            Add-DocumentToSchema -Document $doc -Schema $schema -Path "" -TotalDocs $actualSampleSize
         }
         
         Write-Progress -Activity "Analyzing documents" -Completed
@@ -184,7 +184,7 @@ function Get-MongoDBSchema {
     }
 }
 
-function Analyze-DocumentStructure {
+function Add-DocumentToSchema {
     <#
     .SYNOPSIS
     Recursively analyzes document structure and updates schema
@@ -280,7 +280,7 @@ function Analyze-DocumentStructure {
         elseif (Test-IsDocumentObject -Value $fieldValue) { #if it is a sub-document  than mark it as nested and analyze its structure
             # Nested object
             $Schema[$fullPath].IsNested = $true
-            Analyze-DocumentStructure -Document $fieldValue -Schema $Schema -Path $fullPath -TotalDocs $TotalDocs
+            Add-DocumentToSchema -Document $fieldValue -Schema $Schema -Path $fullPath -TotalDocs $TotalDocs
         }
         elseif ($fieldValue -is [System.Collections.IEnumerable] -and $fieldValue -isnot [string]) {
             # Array or collection
@@ -306,7 +306,7 @@ function Analyze-DocumentStructure {
                 # Recursively analyze nested objects in arrays
                 if (Test-IsDocumentObject -Value $item) {
                     $Schema[$fullPath].IsNested = $true
-                    Analyze-DocumentStructure -Document $item -Schema $Schema -Path "$fullPath[]" -TotalDocs $TotalDocs
+                    Add-DocumentToSchema -Document $item -Schema $Schema -Path "$fullPath[]" -TotalDocs $TotalDocs
                 }
             }
         }
@@ -3352,8 +3352,8 @@ function Compare-DocumentToRecord {
             }
 
             # Normalize values for comparison
-            $mongoNormalized = Normalize-ValueForComparison -Value $mongoValue -DatabaseType $DatabaseType
-            $sqlNormalized = Normalize-ValueForComparison -Value $sqlValue -DatabaseType $DatabaseType
+            $mongoNormalized = ConvertTo-ComparableValue -Value $mongoValue -DatabaseType $DatabaseType
+            $sqlNormalized = ConvertTo-ComparableValue -Value $sqlValue -DatabaseType $DatabaseType
             
             if ($mongoNormalized -ne $sqlNormalized) {
                 $result.Match = $false
@@ -3369,7 +3369,7 @@ function Compare-DocumentToRecord {
     return $result
 }
 
-function Normalize-ValueForComparison {
+function ConvertTo-ComparableValue {
     <#
     .SYNOPSIS
     Normalizes values for comparison between MongoDB and SQL
@@ -5226,7 +5226,10 @@ function Invoke-N2SMigration {
         [switch]$Quiet,
 
         [Parameter(Mandatory=$false)]
-        [switch]$RemoveOrphanTables
+        [switch]$RemoveOrphanTables,
+
+        [Parameter(Mandatory=$false)]
+        [switch]$AllowEmptySource
     )
 
     # An unreachable database or a broken configuration should come out as a
@@ -5273,7 +5276,8 @@ function Invoke-N2SMigration {
                                                    -DatabaseType $DatabaseType `
                                                    -SampleSize $SampleSize `
                                                    -Force `
-                                                   -RemoveOrphanTables:$RemoveOrphanTables
+                                                   -RemoveOrphanTables:$RemoveOrphanTables `
+                                                   -AllowEmptySource:$AllowEmptySource
 
         if ($null -eq $workflowResult) {
             Write-Warning "No collections were processed"
@@ -5420,6 +5424,16 @@ function Get-GhostChildTable {
     $childTables = Get-ChildTableMap -Connection $Connection -TableName $TableName -PrimaryKeyField $PrimaryKeyField
 
     if ($childTables.Count -eq 0) {
+        return $ghosts
+    }
+
+    # No documents means no evidence. Without this guard an empty collection makes
+    # every child table look abandoned, and the cleanup would offer to drop them
+    # all - exactly when there is nothing to compare against.
+    # The nulls have to be filtered out: @($null).Count is 1, not 0, and an empty
+    # collection hands over exactly that.
+    if (@($Documents | Where-Object { $null -ne $_ }).Count -eq 0) {
+        Write-N2SMessage " Skipping the child table check for $TableName : the collection holds no documents" -Level Warning
         return $ghosts
     }
 
@@ -5689,7 +5703,10 @@ function Invoke-MigrationWorkflow {
         [switch]$Force,
 
         [Parameter(Mandatory=$false)]
-        [switch]$RemoveOrphanTables
+        [switch]$RemoveOrphanTables,
+
+        [Parameter(Mandatory=$false)]
+        [switch]$AllowEmptySource
     )
 
     Write-N2SMessage "`n$('=' * 70)" -Level Header
@@ -5770,7 +5787,8 @@ function Invoke-MigrationWorkflow {
                 "FullMigration" {
                     $collectionResult.Details = Invoke-FullMigration -CollectionName $collectionName `
                                                                      -DatabaseType $DatabaseType `
-                                                                     -SampleSize $SampleSize
+                                                                     -SampleSize $SampleSize `
+                                                                     -AllowEmptySource:$AllowEmptySource
                 }
 
                 "IncrementalSync" {
@@ -5959,6 +5977,88 @@ function Get-MongoDBCollections {
 
 
 
+function Test-SourceNotEmptierThanTarget {
+    <#
+    .SYNOPSIS
+    Stops a full migration that would replace filled tables with nothing
+
+    .DESCRIPTION
+    A full migration drops and recreates its tables. With an empty collection that
+    means the rows go and nothing comes back, and worse: without documents no
+    schema can be worked out, so the columns and the child tables disappear as
+    well. A table with only an _id column is left behind.
+
+    Emptying MongoDB should reach SQL, but through a sync: that one compares ids,
+    deletes exactly the rows whose document is gone, reports how many, and leaves
+    the columns and child tables intact.
+
+    So an empty source only blocks a full migration, and only when the target
+    holds rows. Causes seen in practice: a mistyped collection name, the wrong
+    database in the configuration, or a collection emptied in MongoDB.
+
+    Pass -AllowEmptySource to go ahead anyway.
+    #>
+
+    param (
+        [string]$CollectionName,
+        [string]$DatabaseType = "MySQL",
+        [switch]$AllowEmptySource
+    )
+
+    $documentCount = 0
+
+    try {
+        Connect-Mdbc -ConnectionString $script:AppConfig.MongoDB.ConnectionString `
+                     -DatabaseName $script:AppConfig.MongoDB.Database `
+                     -CollectionName $CollectionName
+
+        $documentCount = [int](Get-MdbcData -Count)
+    }
+    catch {
+        throw "Could not read collection '$CollectionName' from MongoDB: $($_.Exception.Message)"
+    }
+
+    if ($documentCount -gt 0) {
+        return
+    }
+
+    # Empty source. Only a problem when the target holds something.
+    $existingRows = 0
+    $connection = $null
+
+    try {
+        $connection = Get-SQLConnectionObject -DatabaseType $DatabaseType
+        $connection.Open()
+
+        $rowCount = Get-SQLTableRowCount -Connection $connection -TableName $CollectionName
+        if ($null -ne $rowCount) {
+            $existingRows = [int]$rowCount
+        }
+    }
+    catch {
+        # Cannot tell; let the migration continue rather than block on a guess
+        return
+    }
+    finally {
+        if ($connection -and $connection.State -eq 'Open') {
+            $connection.Close()
+        }
+    }
+
+    if ($existingRows -gt 0) {
+        if ($AllowEmptySource) {
+            Write-N2SMessage " Collection '$CollectionName' is empty and the $existingRows row(s) in the table will be dropped (-AllowEmptySource)" -Level Warning
+            return
+        }
+
+        throw ("Collection '$CollectionName' holds no documents while table '$CollectionName' holds $existingRows row(s). " +
+               "A full migration would drop those rows, and without documents the columns and child tables are lost as well. " +
+               "Run an IncrementalSync to let the deletions through properly, or pass -AllowEmptySource if you do mean to rebuild the table empty.")
+    }
+
+    Write-N2SMessage " Collection '$CollectionName' is empty; the tables will be created without rows" -Level Warning
+}
+
 function Invoke-FullMigration {
     <#
     .SYNOPSIS
@@ -5968,17 +6068,25 @@ function Invoke-FullMigration {
     param (
         [string]$CollectionName,
         [string]$DatabaseType,
-        [int]$SampleSize
+        [int]$SampleSize,
+        [switch]$AllowEmptySource
     )
-    
+
     $result = @{
         Schema = $null
         SQLSchema = $null
         Migration = $null
         Validation = $null
     }
-    
+
     try {
+        # An empty collection would rebuild the tables without rows and without
+        # columns. Deleting in MongoDB should reach SQL through a sync, which
+        # deletes exactly what is gone and keeps the structure.
+        Test-SourceNotEmptierThanTarget -CollectionName $CollectionName `
+                                        -DatabaseType $DatabaseType `
+                                        -AllowEmptySource:$AllowEmptySource
+
         # Step 1: Analyze schema
         Write-N2SMessage "`n[1/4] Analyzing MongoDB schema..." -Level Header
         $result.Schema = Get-MongoDBSchema -ConnectionString $script:AppConfig.MongoDB.ConnectionString `
@@ -6152,7 +6260,7 @@ function Sync-AllCollections {
     Invoke-MigrationWorkflow -Operation IncrementalSync -DatabaseType $DatabaseType
 }
 
-function Migrate-Collection {
+function Invoke-CollectionMigration {
     <#
     .SYNOPSIS
     Quick function to migrate a specific collection
@@ -6178,7 +6286,7 @@ function Migrate-Collection {
                             -SampleSize $SampleSize
 }
 
-function Validate-Collection {
+function Test-CollectionMigration {
     <#
     .SYNOPSIS
     Quick function to validate a specific collection
@@ -6224,16 +6332,16 @@ function Start-MigrationToolMenu {
         $choice = Read-Host "`n Enter your choice"
         
         switch ($choice) {
-            "1" { Menu-TestConnections }
-            "2" { Menu-DiscoverCollections }
-            "3" { Menu-MigrateSingle }
-            "4" { Menu-MigrateMultiple }
-            "5" { Menu-MigrateAll }
-            "6" { Menu-SyncSingle }
-            "7" { Menu-SyncAll }
-            "8" { Menu-ValidateSingle }
-            "9" { Menu-SchemaOnly }
-            "10" { Menu-CleanupOrphanTables }
+            "1" { Invoke-MenuTestConnections }
+            "2" { Invoke-MenuDiscoverCollections }
+            "3" { Invoke-MenuMigrateSingle }
+            "4" { Invoke-MenuMigrateMultiple }
+            "5" { Invoke-MenuMigrateAll }
+            "6" { Invoke-MenuSyncSingle }
+            "7" { Invoke-MenuSyncAll }
+            "8" { Invoke-MenuValidateSingle }
+            "9" { Invoke-MenuSchemaOnly }
+            "10" { Invoke-MenuCleanupOrphanTables }
             "0" {
                 Write-Host "`n Thank you for using NoSQL to SQL Migration Tool!" -ForegroundColor Cyan
                 $continue = $false 
@@ -6294,7 +6402,7 @@ function Show-MainMenu {
     Write-Host "└────────────────────────────────────────────────────────────┘" -ForegroundColor DarkGray
 }
 
-function Menu-TestConnections {
+function Invoke-MenuTestConnections {
     Write-Host "`n$('=' * 60)" -ForegroundColor Cyan
     Write-Host "Testing Database Connections" -ForegroundColor Cyan
     Write-Host ("="*60) -ForegroundColor Cyan
@@ -6309,7 +6417,7 @@ function Menu-TestConnections {
     }
 }
 
-function Menu-DiscoverCollections {
+function Invoke-MenuDiscoverCollections {
     Write-Host "`n$('=' * 60)" -ForegroundColor Cyan
     Write-Host "Discovering MongoDB Collections" -ForegroundColor Cyan
     Write-Host ("="*60) -ForegroundColor Cyan
@@ -6344,7 +6452,7 @@ function Menu-DiscoverCollections {
     }
 }
 
-function Menu-MigrateSingle {
+function Invoke-MenuMigrateSingle {
     Write-Host "`n$('=' * 60)" -ForegroundColor Cyan
     Write-Host "Migrate Single Collection" -ForegroundColor Cyan
     Write-Host ("="*60) -ForegroundColor Cyan
@@ -6375,7 +6483,7 @@ function Menu-MigrateSingle {
         $confirm = Read-Host "`nThis will perform a FULL MIGRATION (Schema + Data). Continue? (Y/N)"
 
         if ($confirm -eq 'Y' -or $confirm -eq 'y') {
-            Migrate-Collection -CollectionName $collectionName -FullMigration -SampleSize $sampleSize
+            Invoke-CollectionMigration -CollectionName $collectionName -FullMigration -SampleSize $sampleSize
         }
         else {
             Write-Host "`nOperation cancelled." -ForegroundColor Yellow
@@ -6386,7 +6494,7 @@ function Menu-MigrateSingle {
     }
 }
 
-function Menu-MigrateMultiple {
+function Invoke-MenuMigrateMultiple {
     Write-Host "`n$('=' * 60)" -ForegroundColor Cyan
     Write-Host "Migrate Multiple Collections" -ForegroundColor Cyan
     Write-Host ("="*60) -ForegroundColor Cyan
@@ -6436,7 +6544,7 @@ function Menu-MigrateMultiple {
     }
 }
 
-function Menu-MigrateAll {
+function Invoke-MenuMigrateAll {
     Write-Host "`n$('=' * 60)" -ForegroundColor Cyan
     Write-Host "Migrate ALL Collections" -ForegroundColor Cyan
     Write-Host ("="*60) -ForegroundColor Cyan
@@ -6465,7 +6573,7 @@ function Menu-MigrateAll {
     }
 }
 
-function Menu-SyncSingle {
+function Invoke-MenuSyncSingle {
     Write-Host "`n$('=' * 60)" -ForegroundColor Cyan
     Write-Host "Sync Single Collection (Incremental)" -ForegroundColor Cyan
     Write-Host ("="*60) -ForegroundColor Cyan
@@ -6492,14 +6600,14 @@ function Menu-SyncSingle {
         Write-Host $collectionName -ForegroundColor White
         Write-Host "This will sync only NEW/UPDATED/DELETED records (fast!)" -ForegroundColor Gray
         
-        Migrate-Collection -CollectionName $collectionName
+        Invoke-CollectionMigration -CollectionName $collectionName
     }
     else {
         Write-Host "`n Invalid selection." -ForegroundColor Red
     }
 }
 
-function Menu-SyncAll {
+function Invoke-MenuSyncAll {
     Write-Host "`n$('=' * 60)" -ForegroundColor Cyan
     Write-Host "Sync ALL Collections" -ForegroundColor Cyan
     Write-Host ("="*60) -ForegroundColor Cyan
@@ -6527,7 +6635,7 @@ function Menu-SyncAll {
     }
 }
 
-function Menu-ValidateSingle {
+function Invoke-MenuValidateSingle {
     Write-Host "`n$('=' * 60)" -ForegroundColor Cyan
     Write-Host "Validate Single Collection" -ForegroundColor Cyan
     Write-Host ("="*60) -ForegroundColor Cyan
@@ -6558,7 +6666,7 @@ function Menu-ValidateSingle {
             $sampleSize = 10
         }
         
-        Validate-Collection -CollectionName $collectionName
+        Test-CollectionMigration -CollectionName $collectionName
     }
     else {
         Write-Host "`n Invalid selection." -ForegroundColor Red
@@ -6623,7 +6731,7 @@ function Read-SampleSize {
     return $suggested
 }
 
-function Menu-CleanupOrphanTables {
+function Invoke-MenuCleanupOrphanTables {
     <#
     .SYNOPSIS
     Menu item: show tables without a collection and offer to drop them
@@ -6722,7 +6830,7 @@ function Menu-CleanupOrphanTables {
     }
 }
 
-function Menu-SchemaOnly {
+function Invoke-MenuSchemaOnly {
     Write-Host "`n$('=' * 60)" -ForegroundColor Cyan
     Write-Host "Analyze Schema Only" -ForegroundColor Cyan
     Write-Host ("="*60) -ForegroundColor Cyan
