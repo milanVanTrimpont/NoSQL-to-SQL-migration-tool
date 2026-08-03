@@ -1344,6 +1344,56 @@ function ConvertTo-SQLTextValue {
     return $Value.ToString()
 }
 
+function Get-SQLColumnKind {
+    <#
+    .SYNOPSIS
+    Works out once what kind of column this is, and remembers it
+
+    .DESCRIPTION
+    Parsing 'varchar(255)' into "text of at most 255 characters" is the same work
+    for every value in that column. On a migration of ten thousand rows that is
+    ten thousand times the same regular expression, so the answer is cached per
+    column type.
+    #>
+
+    param (
+        [string]$ColumnType
+    )
+
+    if ($null -eq $script:N2SColumnKinds) {
+        $script:N2SColumnKinds = @{}
+    }
+
+    if ($script:N2SColumnKinds.ContainsKey($ColumnType)) {
+        return $script:N2SColumnKinds[$ColumnType]
+    }
+
+    $base = ($ColumnType -replace '\(.*$', '').Trim().ToLowerInvariant()
+
+    $kind = switch -Regex ($base) {
+        '^(datetime|timestamp)$'                            { 'datetime' }
+        '^date$'                                            { 'date' }
+        '^(int|integer|bigint|smallint|mediumint|tinyint)$'  { 'int' }
+        '^(decimal|numeric|float|double|real)$'              { 'decimal' }
+        '^(char|varchar|nvarchar)$'                         { 'varchar' }
+        default                                             { 'text' }
+    }
+
+    $length = 0
+    if ($kind -eq 'varchar' -and $ColumnType -match '\((\d+)\)') {
+        $length = [int]$matches[1]
+    }
+
+    $info = [PSCustomObject]@{
+        Kind   = $kind
+        Base   = $base
+        Length = $length
+    }
+
+    $script:N2SColumnKinds[$ColumnType] = $info
+    return $info
+}
+
 function ConvertTo-SQLColumnValue {
     <#
     .SYNOPSIS
@@ -1371,6 +1421,38 @@ function ConvertTo-SQLColumnValue {
         return $result
     }
 
+    # No column type known: keep the old behaviour
+    if ([string]::IsNullOrWhiteSpace($ColumnType)) {
+        $result.Value = Convert-ToSQLValue -Value $Value -DatabaseType $DatabaseType
+        return $result
+    }
+
+    $column = Get-SQLColumnKind -ColumnType $ColumnType
+
+    # Most values already have the type their column wants. Handing those straight
+    # through skips the whole conversion chain, which is what makes the difference
+    # on tens of thousands of rows.
+    switch ($column.Kind) {
+        'int' {
+            if ($Value -is [int] -or $Value -is [long]) { $result.Value = $Value; return $result }
+        }
+        'decimal' {
+            if ($Value -is [double] -or $Value -is [decimal]) { $result.Value = $Value; return $result }
+        }
+        'varchar' {
+            if ($Value -is [string] -and ($column.Length -eq 0 -or $Value.Length -le $column.Length)) {
+                $result.Value = $Value
+                return $result
+            }
+        }
+        'text' {
+            if ($Value -is [string]) { $result.Value = $Value; return $result }
+        }
+        'datetime' {
+            if ($Value -is [DateTime]) { $result.Value = $Value; return $result }
+        }
+    }
+
     # Normalize the MongoDB value first (ObjectId, BSON types, booleans)
     $value = Convert-ToSQLValue -Value $Value -DatabaseType $DatabaseType
 
@@ -1378,13 +1460,7 @@ function ConvertTo-SQLColumnValue {
         return $result
     }
 
-    # No column type known: keep the old behaviour
-    if ([string]::IsNullOrWhiteSpace($ColumnType)) {
-        $result.Value = $value
-        return $result
-    }
-
-    $baseType = ($ColumnType -replace '\(.*$', '').Trim().ToLowerInvariant()
+    $baseType = $column.Base
 
     switch -Regex ($baseType) {
         '^(datetime|timestamp|date)$' {
@@ -3694,6 +3770,10 @@ function Start-IncrementalSync {
         }
  
         
+        # Read the column layout now, so no SHOW COLUMNS has to run while a
+        # transaction is open further down
+        Get-SQLTableColumns -Connection $sqlConnection -TableName $TableName | Out-Null
+
         # Step 1.6: Find the child tables holding arrays and sub-documents
         $childTables = Get-ChildTableMap -Connection $sqlConnection `
                                          -TableName $TableName `
@@ -3838,73 +3918,108 @@ function Start-IncrementalSync {
             DocumentHashes = @{}
         }
         
-        # Insert new documents
+        # Insert new documents, a chunk at a time: the rows of a chunk are
+        # collected and written together, which is what makes a sync of many
+        # documents finish in seconds instead of minutes
         if ($newDocs.Count -gt 0) {
             Write-N2SMessage "  Inserting $($newDocs.Count) new records..." -Level Success
-            
-            foreach ($item in $newDocs) {
-                try {
-                    $success = Invoke-InsertDocument -Connection $sqlConnection `
+            $rowsWritten = 0
+
+            foreach ($chunk in (Split-IntoChunk -Items $newDocs -Size 100)) {
+                Start-SQLRowBuffer
+                $transaction = $sqlConnection.BeginTransaction()
+
+                foreach ($item in $chunk) {
+                    try {
+                        $success = Invoke-InsertDocument -Connection $sqlConnection `
+                                                         -TableName $TableName `
+                                                         -Document $item.Document `
+                                                         -DatabaseType $DatabaseType
+
+                        if ($success) {
+                            Sync-DocumentChildTables -Connection $sqlConnection `
                                                      -TableName $TableName `
                                                      -Document $item.Document `
-                                                     -DatabaseType $DatabaseType
+                                                     -ChildTables $childTables `
+                                                     -DatabaseType $DatabaseType `
+                                                     -ChildRowCounts $childRowCounts | Out-Null
 
-                    if ($success) {
-                        Sync-DocumentChildTables -Connection $sqlConnection `
-                                                 -TableName $TableName `
-                                                 -Document $item.Document `
-                                                 -ChildTables $childTables `
-                                                 -DatabaseType $DatabaseType | Out-Null
-
-                        $syncResult.NewRecords++
-                        $newSyncState.DocumentHashes[$item.Id] = $item.Hash
+                            $syncResult.NewRecords++
+                            $newSyncState.DocumentHashes[$item.Id] = $item.Hash
+                        }
+                        else {
+                            # No hash is stored, so the next sync retries this document
+                            $syncResult.Errors += "Failed to insert document $($item.Id)"
+                        }
                     }
-                    else {
-                        # No hash is stored, so the next sync retries this document
-                        $syncResult.Errors += "Failed to insert document $($item.Id)"
+                    catch {
+                        $syncResult.Errors += "Failed to insert document $($item.Id): $($_.Exception.Message)"
                     }
                 }
-                catch {
-                    $syncResult.Errors += "Failed to insert document $($item.Id): $($_.Exception.Message)"
-                }
+
+                $rowsWritten += Complete-SyncChunk -Connection $sqlConnection `
+                                                   -Transaction $transaction `
+                                                   -TableName $TableName `
+                                                   -Items $chunk `
+                                                   -SyncResult $syncResult `
+                                                   -SyncState $newSyncState `
+                                                   -CounterName 'NewRecords'
             }
-            
-            Write-N2SMessage "   Inserted $($syncResult.NewRecords) records" -Level Success
+
+            Write-N2SMessage "   Inserted $($syncResult.NewRecords) records ($rowsWritten row(s) in total)" -Level Success
         }
         
-        # Update modified documents
+        # Update modified documents. The main row is an UPDATE and stays per
+        # document, but its child rows are the bulk of the work and those are
+        # collected per chunk.
         if ($updatedDocs.Count -gt 0) {
             Write-N2SMessage "  Updating $($updatedDocs.Count) modified records..." -Level Step
-            
-            foreach ($item in $updatedDocs) {
-                try {
-                    $success = Invoke-UpdateDocument -Connection $sqlConnection `
+            $rowsWritten = 0
+
+            foreach ($chunk in (Split-IntoChunk -Items $updatedDocs -Size 100)) {
+                Start-SQLRowBuffer
+                $transaction = $sqlConnection.BeginTransaction()
+
+                foreach ($item in $chunk) {
+                    try {
+                        $success = Invoke-UpdateDocument -Connection $sqlConnection `
+                                                         -TableName $TableName `
+                                                         -Document $item.Document `
+                                                         -DatabaseType $DatabaseType `
+                                                         -Transaction $transaction
+
+                        if ($success) {
+                            # Child rows are rewritten completely for this document
+                            Sync-DocumentChildTables -Connection $sqlConnection `
                                                      -TableName $TableName `
                                                      -Document $item.Document `
-                                                     -DatabaseType $DatabaseType
+                                                     -ChildTables $childTables `
+                                                     -DatabaseType $DatabaseType `
+                                                     -ChildRowCounts $childRowCounts | Out-Null
 
-                    if ($success) {
-                        # Child rows are rewritten completely for this document
-                        Sync-DocumentChildTables -Connection $sqlConnection `
-                                                 -TableName $TableName `
-                                                 -Document $item.Document `
-                                                 -ChildTables $childTables `
-                                                 -DatabaseType $DatabaseType | Out-Null
-
-                        $syncResult.UpdatedRecords++
-                        $newSyncState.DocumentHashes[$item.Id] = $item.Hash
+                            $syncResult.UpdatedRecords++
+                            $newSyncState.DocumentHashes[$item.Id] = $item.Hash
+                        }
+                        else {
+                            # No hash is stored, so the next sync retries this document
+                            $syncResult.Errors += "Failed to update document $($item.Id)"
+                        }
                     }
-                    else {
-                        # No hash is stored, so the next sync retries this document
-                        $syncResult.Errors += "Failed to update document $($item.Id)"
+                    catch {
+                        $syncResult.Errors += "Failed to update document $($item.Id): $($_.Exception.Message)"
                     }
                 }
-                catch {
-                    $syncResult.Errors += "Failed to update document $($item.Id): $($_.Exception.Message)"
-                }
+
+                $rowsWritten += Complete-SyncChunk -Connection $sqlConnection `
+                                                   -Transaction $transaction `
+                                                   -TableName $TableName `
+                                                   -Items $chunk `
+                                                   -SyncResult $syncResult `
+                                                   -SyncState $newSyncState `
+                                                   -CounterName 'UpdatedRecords'
             }
-            
-            Write-N2SMessage "   Updated $($syncResult.UpdatedRecords) records" -Level Step
+
+            Write-N2SMessage "   Updated $($syncResult.UpdatedRecords) records ($rowsWritten child row(s) rewritten)" -Level Step
         }
         
         # Delete removed documents
@@ -4327,7 +4442,8 @@ function Sync-DocumentChildTables {
         $Document,
         [hashtable]$ChildTables,
         [string]$DatabaseType,
-        [string]$PrimaryKeyField = "_id"
+        [string]$PrimaryKeyField = "_id",
+        [hashtable]$ChildRowCounts
     )
 
     if ($null -eq $ChildTables -or $ChildTables.Count -eq 0) {
@@ -4340,7 +4456,24 @@ function Sync-DocumentChildTables {
 
     foreach ($fieldName in $ChildTables.Keys) {
         $value = @()
-        if ($Document.Keys -contains $fieldName -and $null -ne $Document[$fieldName]) {
+        $hasField = ($Document.Keys -contains $fieldName -and $null -ne $Document[$fieldName])
+
+        # Nothing in the document and nothing in the table for this parent means
+        # there is nothing to clear and nothing to write. Skipping that saves a
+        # call per child table per document, which adds up over a whole sync.
+        if (-not $hasField -and $null -ne $ChildRowCounts -and $ChildRowCounts.ContainsKey($fieldName)) {
+            $existingRows = 0
+
+            if ($ChildRowCounts[$fieldName].ContainsKey("$parentId")) {
+                $existingRows = $ChildRowCounts[$fieldName]["$parentId"]
+            }
+
+            if ($existingRows -eq 0) {
+                continue
+            }
+        }
+
+        if ($hasField) {
             $value = $Document[$fieldName]
         }
 
@@ -4546,76 +4679,162 @@ function Get-AllSQLRecords {
     return $records
 }
 
+function Split-IntoChunk {
+    <#
+    .SYNOPSIS
+    Cuts a list into chunks of at most Size items
+
+    .DESCRIPTION
+    A sync buffers the rows of a chunk before writing them. Chunks keep memory
+    use bounded and keep a transaction from growing without limit.
+    #>
+
+    param (
+        $Items,
+        [int]$Size = 100
+    )
+
+    $chunks = @()
+    $all = @($Items)
+
+    for ($start = 0; $start -lt $all.Count; $start += $Size) {
+        $end = [math]::Min($start + $Size, $all.Count) - 1
+        $chunks += , @($all[$start..$end])
+    }
+
+    return $chunks
+}
+
+function Complete-SyncChunk {
+    <#
+    .SYNOPSIS
+    Writes the buffered rows of a sync chunk and corrects the counters
+
+    .DESCRIPTION
+    The counters are raised while the documents are processed, before the rows
+    are actually written. A row that fails at the flush has to be taken back off
+    the counter, and its hash must not be saved: otherwise the next sync thinks
+    the document is up to date and the failure becomes permanent.
+    #>
+
+    param (
+        $Connection,
+        $Transaction,
+        [string]$TableName,
+        $Items,
+        $SyncResult,
+        $SyncState,
+        [string]$CounterName
+    )
+
+    try {
+        $flush = Invoke-SQLRowBufferFlush -Connection $Connection `
+                                          -Transaction $Transaction `
+                                          -MainTable $TableName
+        $Transaction.Commit()
+
+        foreach ($failedId in $flush.FailedDocuments) {
+            if ($SyncState.DocumentHashes.ContainsKey($failedId)) {
+                $SyncResult[$CounterName]--
+                $SyncState.DocumentHashes.Remove($failedId)
+            }
+
+            $SyncResult.Errors += "Row of document $failedId could not be written"
+        }
+
+        foreach ($flushError in $flush.Errors) {
+            $SyncResult.Errors += $flushError
+        }
+
+        return $flush.RowsWritten
+    }
+    catch {
+        try { $Transaction.Rollback() } catch { }
+
+        foreach ($item in $Items) {
+            if ($SyncState.DocumentHashes.ContainsKey($item.Id)) {
+                $SyncResult[$CounterName]--
+                $SyncState.DocumentHashes.Remove($item.Id)
+            }
+        }
+
+        $SyncResult.Errors += "A chunk was rolled back: $($_.Exception.Message)"
+        return 0
+    }
+    finally {
+        Stop-SQLRowBuffer
+    }
+}
+
 function Invoke-InsertDocument {
     <#
     .SYNOPSIS
     Inserts a new document into SQL
+
+    .DESCRIPTION
+    Uses the same conversion layer as a full migration, so a document that
+    arrives through a sync is treated exactly like one that arrives through a
+    migration. Writing goes through Add-SQLRow, which means the row joins the
+    batch when a row buffer is active.
     #>
-    
+
     param (
         $Connection,
         [string]$TableName,
         $Document,
         [string]$DatabaseType
     )
-    
+
     try {
-        # Get all columns from SQL table
-        $cmd = $Connection.CreateCommand()
-        $cmd.CommandText = "SHOW COLUMNS FROM " + $TableName
-        $reader = $cmd.ExecuteReader()
-        
-        $allColumns = @()
-        while ($reader.Read()) {
-            $columnName = $reader.GetString(0)
-            $allColumns += $columnName
+        # Cached, so this costs no query per document
+        $tableColumns = Get-SQLTableColumns -Connection $Connection -TableName $TableName
+
+        if ($tableColumns.Count -eq 0) {
+            Write-N2SMessage "Insert error: no columns found for table $TableName" -Level Error
+            return $false
         }
-        $reader.Close()
-        
-        # Extract flat fields from document
+
+        # Scalar fields only; arrays and sub-documents belong in a child table
         $documentFields = @{}
-        
+
         if ($Document -is [System.Collections.IDictionary]) {
             foreach ($key in $Document.Keys) {
                 $value = $Document[$key]
-                
-                if ($value -isnot [System.Collections.IEnumerable] -or $value -is [string]) {
-                    if ($value -isnot [PSCustomObject] -and $value -isnot [System.Collections.Hashtable]) {
-                        $documentFields[$key] = $value
-                    }
+
+                if (-not (Test-IsDocumentObject -Value $value) -and
+                    ($null -eq $value -or $value -isnot [System.Collections.IEnumerable] -or $value -is [string])) {
+                    $documentFields[$key] = $value
                 }
             }
         }
-        
-        # Build INSERT with all columns (use NULL for missing fields)
-        $columns = @()
-        $values = @()
-        $parameters = @()
-        
-        foreach ($column in $allColumns) {
-            $columns += '`' + $column + '`'
-            $values += "?"
-            
-            if ($documentFields.ContainsKey($column)) {
-                $parameters += Convert-ToSQLValue -Value $documentFields[$column] -DatabaseType $DatabaseType
+
+        $documentId = if ($null -ne $Document['_id']) { $Document['_id'].ToString() } else { '<unknown>' }
+
+        # Every column of the table, so the row fits the buffer's grouping;
+        # a field the document does not have becomes NULL
+        $row = [ordered]@{}
+
+        foreach ($column in $tableColumns.Keys) {
+            if (-not $documentFields.ContainsKey($column)) {
+                $row[$column] = [DBNull]::Value
+                continue
+            }
+
+            $converted = ConvertTo-SQLColumnValue -Value $documentFields[$column] `
+                                                  -ColumnType $tableColumns[$column] `
+                                                  -DatabaseType $DatabaseType
+
+            if ($converted.Success) {
+                $row[$column] = $converted.Value
             }
             else {
-                $parameters += [DBNull]::Value
+                Add-ConversionIssue -TableName $TableName -DocumentId $documentId -FieldName $column `
+                                    -Reason $converted.Reason -Action 'stored as NULL'
+                $row[$column] = [DBNull]::Value
             }
         }
-        
-        $insertSQL = "INSERT INTO " + ('`' + $TableName + '`') + " (" + ($columns -join ', ') + ") VALUES (" + ($values -join ', ') + ")"
-        
-        $cmd = $Connection.CreateCommand()
-        $cmd.CommandText = $insertSQL
-        
-        foreach ($param in $parameters) {
-            $p = $cmd.CreateParameter()
-            $p.Value = $param
-            $cmd.Parameters.Add($p) | Out-Null
-        }
-        
-        $cmd.ExecuteNonQuery() | Out-Null
+
+        Add-SQLRow -Connection $Connection -TableName $TableName -Row $row -DocumentId $documentId
         return $true
     }
     catch {
@@ -4634,9 +4853,10 @@ function Invoke-UpdateDocument {
         $Connection,
         [string]$TableName,
         $Document,
-        [string]$DatabaseType
+        [string]$DatabaseType,
+        $Transaction
     )
-    
+
     try {
         $docId = $Document._id.ToString()
         
@@ -4671,9 +4891,14 @@ function Invoke-UpdateDocument {
         }
 
         $updateSQL = "UPDATE " + ('`' + $TableName + '`') + " SET " + ($setClauses -join ', ') + ' WHERE `_id` = ?'
-        
+
         $cmd = $Connection.CreateCommand()
         $cmd.CommandText = $updateSQL
+
+        # The caller may have a transaction open for this chunk
+        if ($Transaction) {
+            $cmd.Transaction = $Transaction
+        }
         
         # Add field parameters
         foreach ($field in $flatFields.Keys) {
