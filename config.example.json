@@ -1,0 +1,23 @@
+{
+  "MongoDB": {
+    "ConnectionString": "mongodb://localhost:27017",
+    "Database": "ScriptingPS"
+  },
+  "MySQL": {
+    "Server": "127.0.0.1",
+    "Port": 3307,
+    "Database": "mijn_database",
+    "Username": "root",
+    "Password": "CHANGE_ME"
+  },
+  "SQLServer": {
+    "Server": ".\\SQLEXPRESS",
+    "Database": "TargetDB",
+    "Username": "sa",
+    "Password": "CHANGE_ME"
+  },
+  "Migration": {
+    "BatchSize": 100,
+    "OnConversionError": "Warn"
+  }
+}

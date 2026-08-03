@@ -1,0 +1,13 @@
+docker-compose.yml
+
+# Your own connection settings and passwords; start from config.example.json
+config.json
+
+# Everything the tool generates while running
+schema_*.sql
+sync_state_*.json
+workflow_report_*.json
+conversion_report_*.csv
+validation_*.html
+migration_log_*.txt
+migration.log
