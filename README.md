@@ -16,6 +16,10 @@ Developed for the Applied Computer Science program (3rd year, Scripting).
   of the whole document, and repairs child rows that were removed in SQL.
 * **Validation** — compares record counts and validates sampled documents field by
   field.
+* **Housekeeping** — reports tables whose collection is gone, and child tables
+  whose field disappeared from every document, and drops them only when asked.
+* **Built for volume** — rows go in as multi-row statements inside a transaction
+  per batch, so a migration costs a handful of round trips instead of one per row.
 * **Two ways in** — an interactive menu, and a non-interactive entry point with
   exit codes for Task Scheduler or a pipeline.
 
@@ -126,9 +130,12 @@ anything else will work.
 
 ### 8. Migrate
 
-Choose **[3] Migrate Single Collection**, pick the collection, and use a sample
-size at least as large as the number of documents so no field is missed. Check
-the result afterwards with **[8] Validate Single Collection**.
+Choose **[3] Migrate Single Collection** and pick the collection. It then asks how
+many documents to analyse for the schema and suggests the whole collection —
+press enter to accept. A field that appears only outside the sample gets no
+column, so analysing everything is the safe answer.
+
+Check the result afterwards with **[8] Validate Single Collection**.
 
 ---
 
@@ -136,34 +143,33 @@ the result afterwards with **[8] Validate Single Collection**.
 
 ### Interactive menu
 
-Import the module once per session, then call the menu:
-
-```powershell
-Import-Module .\NoSqlToSqlMigration\NoSqlToSqlMigration.psd1 -Force
-```
-
-```powershell
-Start-MigrationToolMenu
-```
-
-Or let the launcher do both steps, handy for a shortcut or a fresh window:
-
-```powershell
-pwsh -File .\InteractiveMenu.ps1
-```
+Started as in step 7 of the setup: import the module, then `Start-MigrationToolMenu`.
+Or let `pwsh -File .\InteractiveMenu.ps1` do both in one go.
 
 | Option | What it does |
 |---|---|
 | 1 | test the MongoDB and MySQL connections |
 | 2 | list the collections in MongoDB |
-| 3, 4, 5 | full migration of one, several or all collections |
+| 3, 4, 5 | full migration of one, several or all collections; asks how many documents to analyse |
 | 6, 7 | incremental sync of one or all collections |
 | 8 | validate a collection against MongoDB |
-| 9 | analyse the schema only, write nothing |
+| 9 | analyse the schema only, write nothing; asks how many documents to analyse |
 | 10 | drop tables that have nothing behind them in MongoDB anymore |
 
-Option 10 asks twice: you type `YES`, and then confirm each table separately. The
-number of rows is shown, because dropping cannot be undone.
+Option 10 finds two kinds of leftover table, and shows which kind each one is:
+
+* the **collection is gone** from MongoDB, so its table and child tables are
+  never visited again by a sync;
+* the collection still exists but a **field disappeared from every document**, so
+  the child table that held that field is left behind with old rows.
+
+It asks twice: you type `YES`, and then confirm each table separately. The number
+of rows is shown, because dropping cannot be undone. Child tables are dropped
+before their parent, so a foreign key cannot block it.
+
+A sync reports both kinds as a warning without touching anything. The
+whole-database check runs when a run covers every collection, a run on one
+collection says nothing about the other tables.
 
 ### Without a menu, for a scheduled task
 
@@ -205,9 +211,29 @@ $result = Invoke-N2SMigration -Collections films -Operation FullMigration -Sampl
 exit $result.ExitCode
 ```
 
-The result object also holds `TotalSuccess`, `TotalFailed`, `TotalWarnings`,
-`OrphanTables` and the details per collection. Every run writes the same
-information to `workflow_report_<timestamp>.json`.
+The result object holds, in this order:
+
+| Field | Meaning |
+|---|---|
+| `Operation` | what was run |
+| `StartTime`, `EndTime` | when it ran |
+| `Duration`, `DurationSeconds` | how long it took, readable and as a number |
+| `Collections` | the result per collection, including its details |
+| `TotalSuccess`, `TotalWarnings`, `TotalFailed` | counts over the collections |
+| `OrphanTables`, `OrphanTablesRemoved` | tables without a collection behind them |
+| `ExitCode` | 0, 1 or 2 as above |
+
+The migration and sync results carry the same `Duration` and `DurationSeconds`,
+which makes it easy to compare a slow run with a fast one. Every run writes all
+of it to `workflow_report_<timestamp>.json`.
+
+To clean up leftover tables in the same run, add `-RemoveOrphanTables`. In an
+automated run there is nobody to answer a confirmation, so passing the switch
+counts as the confirmation itself and a warning says so in the log:
+
+```powershell
+Invoke-N2SMigration -Operation IncrementalSync -RemoveOrphanTables
+```
 
 ---
 
@@ -233,6 +259,48 @@ A value that still does not fit is handled according to
 Whatever the setting, every problem ends up in
 `conversion_report_<collection>_<timestamp>.csv` with the table, document, field,
 reason and the action taken. Nothing disappears without a trace.
+
+---
+
+## Speed, and why it is built this way
+
+Rows are not written one at a time. Per batch of documents the tool opens one
+transaction, collects the rows per table and per set of columns, and sends them as
+multi-row statements. Measured on a local MySQL: row by row does about 200 rows
+per second, the same rows in multi-row statements inside a transaction more than
+11,000. A batch of 100 documents with 3,300 rows goes in 10 statements instead of
+3,300 round trips.
+
+Change detection hashes the document's own BSON bytes rather than walking every
+value from PowerShell. On one document with a few hundred sub-documents that is
+the difference between 16 seconds and a third of a second.
+
+Measured on a collection of 1,000 documents with 10,000 child rows:
+
+| Operation | Time |
+|---|---|
+| Full migration | ~8 s |
+| Full sync, every document rewritten | ~11 s |
+| Incremental sync, nothing changed | ~1 s |
+| Repair after rows were deleted in SQL | ~2 s |
+
+A full sync only happens when the state file is missing or `-ForceFullSync` is
+given; day to day you are in the one-second case.
+
+**Why batching and not parallel processing:** the bottleneck was the number of
+round trips to the database, not a shortage of threads. Ten threads that each
+still write row by row only make that ten times less bad; one statement with 500
+rows makes it a hundred times less bad. After this change the database is no
+longer the slowest part — the per-row work in PowerShell is, and that is where
+parallel runspaces would be the next step.
+
+If a statement fails, that chunk is retried row by row, so one bad row costs its
+own row instead of the whole batch, and the report names the document it came
+from. If a commit fails, the whole batch is rolled back and that is reported.
+
+Not everything is batched: during a sync the main row of a changed document is a
+single `UPDATE`, one round trip per document. Its child rows are batched, and
+those are the bulk of the work.
 
 ---
 
@@ -310,6 +378,15 @@ as the collection, so every field is seen.
 The `sync_state_<collection>.json` file is missing, so there is nothing to compare
 against. Not an error, only slower.
 
+**Every document looks changed after updating the tool**
+The way a document is hashed changed, so the stored hashes no longer match. The
+first sync rewrites everything once and is back to normal after that.
+
+**A sync of one collection takes much longer than expected**
+Check whether you are syncing all collections instead of the one you changed:
+option 7 in the menu, or `Start-Migration.ps1` without `-Collections`, walks the
+whole database.
+
 ---
 
 ## Known limitations
@@ -322,27 +399,65 @@ against. Not an error, only slower.
 * **SQL Server** is not supported as a migration target, see above.
 * The **schema is based on a sample**. With a sample smaller than the collection a
   field can be missed, and then its column will not exist.
+* **Field order counts** for change detection. The hash comes from the document's
+  BSON, which keeps the order the fields are stored in. If MongoDB writes them in
+  a different order after an update, the document is seen as changed and rewritten.
+  That costs a rewrite, not data.
 
 ---
 
 ## Sources
 
-The following sources were used during development:
+What each source was actually used for, rather than a list of links.
 
-**Claude and ChatGPT** for the data migration, validation and sync
-**GitHub Copilot** for error handling
+### Libraries and drivers
 
-**DB connection:**
-<https://medium.com/@kavindra.mpez/database-automation-powershell-connectivity-with-mysql-ado-net-provider-powershell-cmdlets-b1c4f528eeab>
+| Source | Used for |
+|---|---|
+| [Mdbc](https://github.com/nightroman/Mdbc) | MongoDB from PowerShell: `Connect-Mdbc`, `Get-MdbcData`, `Add-MdbcData`, `Remove-MdbcCollection` |
+| [MongoDB C#/.NET driver](https://www.mongodb.com/docs/drivers/csharp/current/) | `BsonDocument` and `ToBsonDocument()`, used to hash a document from its own BSON |
+| [MySQL Connector/NET](https://dev.mysql.com/doc/connector-net/en/) | `MySqlConnection`, parameterised commands, transactions |
+| [Connecting PowerShell to MySQL](https://medium.com/@kavindra.mpez/database-automation-powershell-connectivity-with-mysql-ado-net-provider-powershell-cmdlets-b1c4f528eeab) | the first working connection, before the driver was loaded dynamically |
 
-**Pester tests:** <https://pester.dev/docs/quick-start> and
-<https://www.youtube.com/watch?v=iWbemnUpGx4>
+### PowerShell
 
-**Output streams:**
-<https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_output_streams>
+| Source | Used for |
+|---|---|
+| [about_Output_Streams](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_output_streams) | the reason the core reports with levels: `Write-Host` also writes to the information stream, but always shows on the console unless that stream is redirected. That is why it is unsuitable for the core and fine in the menu. |
+| [Everything about ShouldProcess](https://learn.microsoft.com/en-us/powershell/scripting/learn/deep-dives/everything-about-shouldprocess) | the confirmation before a table is dropped, plus `-WhatIf` and `-Confirm:$false` |
+| [How to write a module manifest](https://learn.microsoft.com/en-us/powershell/scripting/developer/module/how-to-write-a-powershell-module-manifest) | the `.psd1` |
+| [PowerShell documentation](https://learn.microsoft.com/en-us/powershell/) | general reference |
 
-**ShouldProcess, the confirmation before dropping a table:**
-<https://learn.microsoft.com/en-us/powershell/scripting/learn/deep-dives/everything-about-shouldprocess>
+### MySQL
 
-**Extra:** <https://learn.microsoft.com/en-us/powershell/> and
-<https://learn.microsoft.com/en-us/powershell/scripting/developer/module/how-to-write-a-powershell-module-manifest>
+| Source | Used for |
+|---|---|
+| [INSERT](https://dev.mysql.com/doc/refman/8.0/en/insert.html) | multi-row statements, the basis of the batching |
+[FOREIGN KEY constraints](https://dev.mysql.com/doc/refman/8.0/en/create-table-foreign-keys.html) | the link between a main table and its child tables, and the drop order |
+|  [Data type storage requirements](https://dev.mysql.com/doc/refman/8.0/en/storage-requirements.html) | why long text becomes `LONGTEXT` instead of a longer `VARCHAR` |
+
+### .NET
+
+| Source | Used for |
+|---|---|
+| [DateTime.TryParseExact](https://learn.microsoft.com/en-us/dotnet/api/system.datetime.tryparseexact) | reading dates in several notations, one format at a time so day-first wins over month-first |
+| [CultureInfo.InvariantCulture](https://learn.microsoft.com/en-us/dotnet/api/system.globalization.cultureinfo.invariantculture) | numbers and dates that mean the same on every machine |
+
+### Testing
+
+| Source | Used for |
+|---|---|
+| [Pester quick start](https://pester.dev/docs/quick-start) | the structure of the test files |
+| [Pester: InModuleScope](https://pester.dev/docs/commands/InModuleScope) | testing functions the module does not export |
+| [Pester: Mock](https://pester.dev/docs/usage/mocking) | running the tests without a database |
+| [Pester tutorial (video)](https://www.youtube.com/watch?v=iWbemnUpGx4) | first steps with Pester |
+
+### AI assistance
+
+AI was used as a tool during development.
+
+* **Claude Code (Opus 5)** — the data migration, validation and synchronisation,
+  the conversion layer for type and format differences, batched writing, the
+  Pester suite and this README.
+* **ChatGPT** — sparring on the schema analysis and the sync design.
+* **GitHub Copilot** — error handling and repetitive code.

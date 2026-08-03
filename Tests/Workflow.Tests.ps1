@@ -186,7 +186,7 @@ Describe "Get-GhostChildTable" {
     }
 }
 
-Describe "Sort-OrphanTableForDrop" {
+Describe "Get-OrphanTableDropOrder" {
 
     It "puts a child table before its parent, so a foreign key cannot block the drop" {
         InModuleScope NoSqlToSqlMigration {
@@ -195,7 +195,7 @@ Describe "Sort-OrphanTableForDrop" {
                 [PSCustomObject]@{ Table = "users_roles"; Rows = 3 }
             )
 
-            $sorted = @(Sort-OrphanTableForDrop -Orphans $orphans)
+            $sorted = @(Get-OrphanTableDropOrder -Orphans $orphans)
 
             $sorted[0].Table | Should -Be "users_roles"
             $sorted[1].Table | Should -Be "users"

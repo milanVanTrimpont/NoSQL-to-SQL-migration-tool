@@ -5480,7 +5480,7 @@ function Remove-OrphanSQLTable {
     }
 }
 
-function Sort-OrphanTableForDrop {
+function Get-OrphanTableDropOrder {
     <#
     .SYNOPSIS
     Puts child tables before their parent, so a foreign key cannot block the drop
@@ -5822,7 +5822,7 @@ function Invoke-MigrationWorkflow {
                     if ($RemoveOrphanTables) {
                         Write-N2SMessage "  These tables and their data will be dropped permanently." -Level Warning
 
-                        foreach ($orphan in (Sort-OrphanTableForDrop -Orphans $orphans)) {
+                        foreach ($orphan in (Get-OrphanTableDropOrder -Orphans $orphans)) {
                             try {
                                 if (Remove-OrphanSQLTable -Connection $orphanConnection -TableName $orphan.Table -RowCount $orphan.Rows) {
                                     $overallResults.OrphanTablesRemoved += $orphan.Table
@@ -6137,18 +6137,21 @@ function Migrate-Collection {
     param (
         [Parameter(Mandatory=$true)]
         [string]$CollectionName,
-        
+
         [ValidateSet("MySQL", "SQLServer")]
         [string]$DatabaseType = "MySQL",
-        
-        [switch]$FullMigration
+
+        [switch]$FullMigration,
+
+        [int]$SampleSize = 100
     )
-    
+
     $operation = if ($FullMigration) { "FullMigration" } else { "IncrementalSync" }
-    
+
     Invoke-MigrationWorkflow -Collections @($CollectionName) `
                             -Operation $operation `
-                            -DatabaseType $DatabaseType
+                            -DatabaseType $DatabaseType `
+                            -SampleSize $SampleSize
 }
 
 function Validate-Collection {
@@ -6343,10 +6346,12 @@ function Menu-MigrateSingle {
         Write-Host "`nYou selected: " -NoNewline -ForegroundColor Gray
         Write-Host $collectionName -ForegroundColor White
         
+        $sampleSize = Read-SampleSize -DocumentCount (Get-CollectionDocumentCount -CollectionName $collectionName)
+
         $confirm = Read-Host "`nThis will perform a FULL MIGRATION (Schema + Data). Continue? (Y/N)"
-        
+
         if ($confirm -eq 'Y' -or $confirm -eq 'y') {
-            Migrate-Collection -CollectionName $collectionName -FullMigration
+            Migrate-Collection -CollectionName $collectionName -FullMigration -SampleSize $sampleSize
         }
         else {
             Write-Host "`nOperation cancelled." -ForegroundColor Yellow
@@ -6396,10 +6401,11 @@ function Menu-MigrateMultiple {
         Write-Host "  • $col" -ForegroundColor White
     }
     
+    $sampleSize = Read-SampleSize
     $confirm = Read-Host "`nMigrate these collections? (Y/N)"
     
     if ($confirm -eq 'Y' -or $confirm -eq 'y') {
-        Invoke-MigrationWorkflow -Collections $selectedCollections -Operation FullMigration
+        Invoke-MigrationWorkflow -Collections $selectedCollections -Operation FullMigration -SampleSize $sampleSize
     }
     else {
         Write-Host "`nOperation cancelled." -ForegroundColor Yellow
@@ -6424,10 +6430,11 @@ function Menu-MigrateAll {
     }
     
     Write-Host "`n WARNING: This is a FULL MIGRATION (may take time)" -ForegroundColor Red
+    $sampleSize = Read-SampleSize
     $confirm = Read-Host "`nAre you sure? (Y/N)"
     
     if ($confirm -eq 'Y' -or $confirm -eq 'y') {
-        Invoke-MigrationWorkflow -Collections $collections -Operation FullMigration
+        Invoke-MigrationWorkflow -Collections $collections -Operation FullMigration -SampleSize $sampleSize
     }
     else {
         Write-Host "`nOperation cancelled." -ForegroundColor Yellow
@@ -6534,6 +6541,64 @@ function Menu-ValidateSingle {
     }
 }
 
+function Get-CollectionDocumentCount {
+    <#
+    .SYNOPSIS
+    Number of documents in a collection, or 0 when it cannot be read
+    #>
+
+    param (
+        [string]$CollectionName
+    )
+
+    try {
+        Connect-Mdbc -ConnectionString $script:AppConfig.MongoDB.ConnectionString `
+                     -DatabaseName $script:AppConfig.MongoDB.Database `
+                     -CollectionName $CollectionName
+
+        return [int](Get-MdbcData -Count)
+    }
+    catch {
+        return 0
+    }
+}
+
+function Read-SampleSize {
+    <#
+    .SYNOPSIS
+    Asks how many documents to analyse for the schema
+
+    .DESCRIPTION
+    The schema comes from a sample, so a field that only appears in a later
+    document gets no column. Analysing everything is the safe answer; on a very
+    large collection it costs time, which is why it is a question and not a fixed
+    number. Pressing enter keeps the suggested value.
+    #>
+
+    param (
+        [int]$DocumentCount = 0
+    )
+
+    $suggested = if ($DocumentCount -gt 0) { $DocumentCount } else { 100 }
+
+    Write-Host "`nThe schema is built from a sample. A field that appears only outside" -ForegroundColor Gray
+    Write-Host "the sample gets no column, so analysing every document is the safe choice." -ForegroundColor Gray
+
+    $answer = Read-Host "Documents to analyse (enter for $suggested)"
+
+    if ([string]::IsNullOrWhiteSpace($answer)) {
+        return $suggested
+    }
+
+    $parsed = 0
+    if ([int]::TryParse($answer.Trim(), [ref]$parsed) -and $parsed -gt 0) {
+        return $parsed
+    }
+
+    Write-Host "Not a number, using $suggested" -ForegroundColor Yellow
+    return $suggested
+}
+
 function Menu-CleanupOrphanTables {
     <#
     .SYNOPSIS
@@ -6619,7 +6684,7 @@ function Menu-CleanupOrphanTables {
         # Child tables first, so a foreign key cannot block the drop
         $dropped = 0
 
-        foreach ($orphan in (Sort-OrphanTableForDrop -Orphans $orphans)) {
+        foreach ($orphan in (Get-OrphanTableDropOrder -Orphans $orphans)) {
             if (Remove-OrphanSQLTable -Connection $connection -TableName $orphan.Table -RowCount $orphan.Rows) {
                 $dropped++
             }
@@ -6662,8 +6727,10 @@ function Menu-SchemaOnly {
         
         Write-Host "`nAnalyzing schema for: " -NoNewline -ForegroundColor Gray
         Write-Host $collectionName -ForegroundColor White
-        
-        Invoke-MigrationWorkflow -Collections @($collectionName) -Operation SchemaOnly
+
+        $sampleSize = Read-SampleSize -DocumentCount (Get-CollectionDocumentCount -CollectionName $collectionName)
+
+        Invoke-MigrationWorkflow -Collections @($collectionName) -Operation SchemaOnly -SampleSize $sampleSize
     }
     else {
         Write-Host "`n Invalid selection." -ForegroundColor Red
