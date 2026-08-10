@@ -239,6 +239,34 @@ Describe "Get-CollectionResultStatus" {
         }
     }
 
+    It "calls a table that could not be created a failure" {
+        # Regression: a failed CREATE TABLE was a warning, so a run in which two
+        # child tables were missing still reported "completed successfully"
+        InModuleScope NoSqlToSqlMigration {
+            $details = @{ Migration = @{
+                FailedDocuments = 0; TotalDocuments = 1; ConversionIssues = @()
+                Errors = @(@{ Document = 'table films_users'; Error = 'could not be created: Row size too large' })
+            } }
+            $status = Get-CollectionResultStatus -Details $details
+
+            $status.Success | Should -BeFalse
+            $status.Reason | Should -Match 'films_users'
+            $status.Reason | Should -Match 'Row size too large'
+        }
+    }
+
+    It "still names the documents when documents failed as well" {
+        # The document count is the more useful reason, so it comes first
+        InModuleScope NoSqlToSqlMigration {
+            $details = @{ Migration = @{
+                FailedDocuments = 2; TotalDocuments = 10; ConversionIssues = @()
+                Errors = @(@{ Document = 'document abc'; Error = 'row could not be written' })
+            } }
+
+            (Get-CollectionResultStatus -Details $details).Reason | Should -Match '2 of 10'
+        }
+    }
+
     It "calls a failed validation a failure" {
         InModuleScope NoSqlToSqlMigration {
             $details = @{ Validation = @{ OverallStatus = 'FAILED'; Issues = @("x"); RecordCountMatch = $true } }

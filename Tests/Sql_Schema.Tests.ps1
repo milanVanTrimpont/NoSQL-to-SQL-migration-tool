@@ -234,3 +234,120 @@ Describe "Split-SQLStatement" {
         }
     }
 }
+
+Describe "Get-SQLColumnRowBytes" {
+
+    It "counts four bytes per character for a bounded text column" {
+        # utf8mb4: a VARCHAR(255) costs 1020 bytes plus a two byte length prefix
+        InModuleScope NoSqlToSqlMigration {
+            Get-SQLColumnRowBytes -ColumnDefinition "    [title] VARCHAR(255)" | Should -Be 1022
+        }
+    }
+
+    It "counts a short text column with a one byte prefix" {
+        InModuleScope NoSqlToSqlMigration {
+            Get-SQLColumnRowBytes -ColumnDefinition "    [_id] VARCHAR(24) PRIMARY KEY NOT NULL" | Should -Be 97
+        }
+    }
+
+    It "counts unbounded text as a pointer, because it lives outside the row" {
+        InModuleScope NoSqlToSqlMigration {
+            Get-SQLColumnRowBytes -ColumnDefinition "    [storyline] VARCHAR(MAX)" | Should -Be 12
+            Get-SQLColumnRowBytes -ColumnDefinition "    [storyline] LONGTEXT" | Should -Be 12
+        }
+    }
+
+    It "counts the fixed types" {
+        InModuleScope NoSqlToSqlMigration {
+            Get-SQLColumnRowBytes -ColumnDefinition "    [id] INT IDENTITY(1,1) PRIMARY KEY" | Should -Be 4
+            Get-SQLColumnRowBytes -ColumnDefinition "    [score] DECIMAL(18,2)" | Should -Be 9
+            Get-SQLColumnRowBytes -ColumnDefinition "    [active] BIT" | Should -Be 1
+            Get-SQLColumnRowBytes -ColumnDefinition "    [created] DATETIME2" | Should -Be 8
+        }
+    }
+}
+
+Describe "Convert-WideColumnToText" {
+
+    BeforeAll {
+        function New-WideCreateStatement {
+            param ([int]$ColumnCount)
+
+            $columns = @("    [id] INT IDENTITY(1,1) PRIMARY KEY", "    [films__id] VARCHAR(255) NOT NULL")
+            1..$ColumnCount | ForEach-Object { $columns += "    [field_$_] VARCHAR(255)" }
+
+            return "CREATE TABLE [films_wide] (`n" + ($columns -join ",`n") + "`n);`n"
+        }
+    }
+
+    It "leaves a table that fits alone" {
+        $statement = New-WideCreateStatement -ColumnCount 5
+
+        InModuleScope NoSqlToSqlMigration -Parameters @{ Statement = $statement } {
+            param($Statement)
+
+            Convert-WideColumnToText -SQLText $Statement | Should -Be $Statement
+        }
+    }
+
+    It "converts text columns until the row fits" {
+        # 110 columns of VARCHAR(255) need about 112 KB, MySQL allows 64 KB
+        $statement = New-WideCreateStatement -ColumnCount 110
+
+        InModuleScope NoSqlToSqlMigration -Parameters @{ Statement = $statement } {
+            param($Statement)
+
+            $WarningPreference = 'SilentlyContinue'
+            $result = Convert-WideColumnToText -SQLText $Statement
+
+            $result | Should -Match 'VARCHAR\(MAX\)'
+
+            # And what comes out has to fit
+            $rowBytes = 0
+            foreach ($line in ($result -split "`n" | Where-Object { $_ -match '^\s*\[' })) {
+                $rowBytes += Get-SQLColumnRowBytes -ColumnDefinition $line
+            }
+
+            $rowBytes | Should -BeLessThan 65535
+        }
+    }
+
+    It "keeps the key columns as they are" {
+        # A LONGTEXT cannot carry a primary key nor be the target of a foreign key
+        $statement = New-WideCreateStatement -ColumnCount 110
+
+        InModuleScope NoSqlToSqlMigration -Parameters @{ Statement = $statement } {
+            param($Statement)
+
+            $WarningPreference = 'SilentlyContinue'
+            $result = Convert-WideColumnToText -SQLText $Statement
+
+            $result | Should -Match '\[films__id\] VARCHAR\(255\) NOT NULL'
+            $result | Should -Match '\[id\] INT IDENTITY'
+        }
+    }
+
+    It "changes no more columns than it has to" {
+        $statement = New-WideCreateStatement -ColumnCount 70
+
+        InModuleScope NoSqlToSqlMigration -Parameters @{ Statement = $statement } {
+            param($Statement)
+
+            $WarningPreference = 'SilentlyContinue'
+            $result = Convert-WideColumnToText -SQLText $Statement
+
+            # 70 columns need about 71 KB, so only a handful have to go
+            $converted = @([regex]::Matches($result, 'VARCHAR\(MAX\)')).Count
+            $converted | Should -BeGreaterThan 0
+            $converted | Should -BeLessThan 20
+        }
+    }
+
+    It "leaves a statement without columns alone" {
+        InModuleScope NoSqlToSqlMigration {
+            $drop = "DROP TABLE IF EXISTS [films];"
+
+            Convert-WideColumnToText -SQLText $drop | Should -Be $drop
+        }
+    }
+}

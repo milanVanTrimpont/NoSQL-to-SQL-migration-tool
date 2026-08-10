@@ -252,10 +252,14 @@ function Add-DocumentToSchema {
                 Count = 0
                 IsNested = $false
                 IsArray = $false
+                IsMap = $false
                 SampleValues = @()
                 ArrayElementTypes = @{}
                 MaxLength = 0
                 MaxElementLength = 0
+                MaxKeyLength = 0
+                MaxInteger = [int64]0
+                MinInteger = [int64]0
             }
         }
         
@@ -276,6 +280,30 @@ function Add-DocumentToSchema {
         # dictionary is also enumerable and would otherwise look like an array
         if ($null -eq $fieldValue) {
             # Null value - already counted in types
+        }
+        elseif (Test-IsDocumentMap -Value $fieldValue) {
+            # A sub-document whose keys are ids, not field names. Handled like an
+            # array of objects, with the key kept in its own column, so it becomes
+            # one row per key instead of one column per key.
+            $Schema[$fullPath].IsArray = $true
+            $Schema[$fullPath].IsMap = $true
+
+            foreach ($entry in (Get-DocumentProperty -Document $fieldValue)) {
+                if ($Schema[$fullPath].ArrayElementTypes.ContainsKey('object')) {
+                    $Schema[$fullPath].ArrayElementTypes['object']++
+                }
+                else {
+                    $Schema[$fullPath].ArrayElementTypes['object'] = 1
+                }
+
+                # The key becomes a column, so its length has to fit
+                $keyLength = "$($entry.Name)".Length
+                if ($keyLength -gt $Schema[$fullPath].MaxKeyLength) {
+                    $Schema[$fullPath].MaxKeyLength = $keyLength
+                }
+
+                Add-DocumentToSchema -Document $entry.Value -Schema $Schema -Path "$fullPath[]" -TotalDocs $TotalDocs
+            }
         }
         elseif (Test-IsDocumentObject -Value $fieldValue) { #if it is a sub-document  than mark it as nested and analyze its structure
             # Nested object
@@ -301,6 +329,14 @@ function Add-DocumentToSchema {
                     if ($itemLength -gt $Schema[$fullPath].MaxElementLength) {
                         $Schema[$fullPath].MaxElementLength = $itemLength
                     }
+
+                    # And the range, for the same reason as above
+                    if ($item -is [int] -or $item -is [long] -or $item -is [int16] -or $item -is [byte]) {
+                        $asLong = [int64]$item
+
+                        if ($asLong -gt $Schema[$fullPath].MaxInteger) { $Schema[$fullPath].MaxInteger = $asLong }
+                        if ($asLong -lt $Schema[$fullPath].MinInteger) { $Schema[$fullPath].MinInteger = $asLong }
+                    }
                 }
 
                 # Recursively analyze nested objects in arrays
@@ -311,6 +347,16 @@ function Add-DocumentToSchema {
             }
         }
         else {
+            # Range of the whole numbers, so the column can hold them: INT stops at
+            # 2147483647 and a timestamp in milliseconds is bigger than that
+            if ($fieldValue -is [int] -or $fieldValue -is [long] -or
+                $fieldValue -is [int16] -or $fieldValue -is [byte]) {
+                $asLong = [int64]$fieldValue
+
+                if ($asLong -gt $Schema[$fullPath].MaxInteger) { $Schema[$fullPath].MaxInteger = $asLong }
+                if ($asLong -lt $Schema[$fullPath].MinInteger) { $Schema[$fullPath].MinInteger = $asLong }
+            }
+
             # Track the real (untruncated) length so column sizes fit the data
             $valueStr = $fieldValue.ToString()
             if ($valueStr.Length -gt $Schema[$fullPath].MaxLength) {
@@ -328,6 +374,137 @@ function Add-DocumentToSchema {
             }
         }
     }
+}
+
+function Get-DocumentProperty {
+    <#
+    .SYNOPSIS
+    Returns the fields of a document as Name and Value pairs
+
+    .DESCRIPTION
+    A document arrives as Mdbc.Dictionary from MongoDB, as a Hashtable from a
+    test, and as a PSCustomObject from ConvertFrom-Json. This is the one place
+    that knows how to walk all three.
+    #>
+
+    param (
+        $Document
+    )
+
+    if ($null -eq $Document) {
+        return @()
+    }
+
+    if ($Document -is [System.Collections.IDictionary]) {
+        return @($Document.GetEnumerator() | ForEach-Object {
+            [PSCustomObject]@{ Name = $_.Key; Value = $_.Value }
+        })
+    }
+
+    if ($Document -is [PSCustomObject]) {
+        return @($Document.PSObject.Properties | ForEach-Object {
+            [PSCustomObject]@{ Name = $_.Name; Value = $_.Value }
+        })
+    }
+
+    return @()
+}
+
+function Test-IsDocumentMap {
+    <#
+    .SYNOPSIS
+    Tells whether the keys of a sub-document are data instead of field names
+
+    .DESCRIPTION
+    An export from Firebase or Firestore looks like this:
+
+        "users": { "user_001": { ... }, "user_002": { ... } }
+
+    That is not a record with a field per key, it is a collection whose key is an
+    id. Read as a record it gives a column per id: a table with 2297 columns that
+    MySQL refuses, and that says nothing about the data. Read as a collection it
+    gives one row per key, which is what the id was meant to be.
+
+    A sub-document counts as such a collection when it holds at least three keys,
+    every value is a document, and those documents describe the same thing: at
+    least 70% of the field names has to be shared. That keeps a real record such as
+    { address: {...}, contact: {...}, metadata: {...} } out of it, because those
+    three have no field names in common.
+
+    "Shared" deliberately does not mean "present in every value". An optional field
+    is normal in MongoDB, and demanding it in every record lets a single extra field
+    lower the score for all the others, which flips the whole table back to a column
+    per id. A field counts as shared once it appears in half of the values.
+
+    .PARAMETER Value
+    The sub-document to judge.
+
+    .PARAMETER MinimumKeys
+    Below this, a record is the safer reading: two keys with the same shape are
+    genuinely ambiguous.
+
+    .PARAMETER MinimumOverlap
+    How much of the field names have to be shared, between 0 and 1.
+
+    .PARAMETER MinimumFieldPresence
+    In what part of the values a field has to appear before it counts as shared.
+    At 1 the field has to be in every value, which is what makes an optional field
+    expensive.
+    #>
+
+    param (
+        $Value,
+
+        [int]$MinimumKeys = 3,
+
+        [double]$MinimumOverlap = 0.7,
+
+        [double]$MinimumFieldPresence = 0.5
+    )
+
+    if (-not (Test-IsDocumentObject -Value $Value)) {
+        return $false
+    }
+
+    $entries = @(Get-DocumentProperty -Document $Value)
+
+    if ($entries.Count -lt $MinimumKeys) {
+        return $false
+    }
+
+    # One value that is not a document is enough: then the keys are field names
+    foreach ($entry in $entries) {
+        if (-not (Test-IsDocumentObject -Value $entry.Value)) {
+            return $false
+        }
+    }
+
+    # Do the values describe the same thing? Counted per field name: in how many
+    # of the values does it appear?
+    $fieldCounts = @{}
+
+    foreach ($entry in $entries) {
+        foreach ($property in (Get-DocumentProperty -Document $entry.Value)) {
+            if ($fieldCounts.ContainsKey($property.Name)) {
+                $fieldCounts[$property.Name]++
+            }
+            else {
+                $fieldCounts[$property.Name] = 1
+            }
+        }
+    }
+
+    if ($fieldCounts.Count -eq 0) {
+        # Only empty documents: rows are still more useful than empty columns
+        return $true
+    }
+
+    # A field seen often enough is part of the shape; one that turns up here and
+    # there is optional and says nothing about record or collection
+    $presenceNeeded = $entries.Count * $MinimumFieldPresence
+    $sharedFields = @($fieldCounts.Values | Where-Object { $_ -ge $presenceNeeded }).Count
+
+    return (($sharedFields / $fieldCounts.Count) -ge $MinimumOverlap)
 }
 
 function Test-IsDocumentObject {
@@ -966,7 +1143,30 @@ To ensure that all database connections are correctly configured and operational
                     }
                 }
                 catch {
-                    Write-N2SMessage "⚠ Table creation warning: $($_.Exception.Message)" -Level Step
+                    if ($singleStatement -match 'CREATE TABLE\s+[`\[]?([^`\]\s(]+)') {
+                        $failedTable = $matches[1]
+
+                        Write-N2SMessage " Could not create table $failedTable : $($_.Exception.Message)" -Level Error
+                        $migrationResult.Errors += @{
+                            Document  = "table $failedTable"
+                            Error     = "could not be created: $($_.Exception.Message)"
+                            Timestamp = Get-Date
+                        }
+
+                        # Without the main table nothing else can succeed, and
+                        # continuing would only bury the cause under warnings
+                        if ($failedTable -eq $SQLSchema.MainTable) {
+                            throw "The main table '$failedTable' could not be created: $($_.Exception.Message)"
+                        }
+                    }
+                    else {
+                        Write-N2SMessage " Schema statement failed: $($_.Exception.Message)" -Level Error
+                        $migrationResult.Errors += @{
+                            Document  = "schema statement"
+                            Error     = $_.Exception.Message
+                            Timestamp = Get-Date
+                        }
+                    }
                 }
             }
         }
@@ -1027,7 +1227,7 @@ To ensure that all database connections are correctly configured and operational
                 catch {
                     $migrationResult.FailedDocuments++
                     $migrationResult.Errors += @{
-                        Document = $doc._id
+                        Document = "document $($doc._id)"
                         Error = $_.Exception.Message
                         Timestamp = Get-Date
                     }
@@ -1048,7 +1248,7 @@ To ensure that all database connections are correctly configured and operational
                     $migrationResult.MigratedDocuments--
                     $migrationResult.FailedDocuments++
                     $migrationResult.Errors += @{
-                        Document  = $failedId
+                        Document  = "document $failedId"
                         Error     = "row could not be written"
                         Timestamp = Get-Date
                     }
@@ -1103,9 +1303,12 @@ To ensure that all database connections are correctly configured and operational
         Write-N2SMessage "Successfully migrated: $($migrationResult.MigratedDocuments)" -Level Success
         Write-N2SMessage "Failed: $($migrationResult.FailedDocuments)" -Level $(if ($migrationResult.FailedDocuments -gt 0) { 'Error' } else { 'Detail' })
         
+        # Info, not Detail: the rows per table are the result of the migration, and
+        # as Detail they only reached the verbose stream. An unattended run then
+        # printed the header with nothing under it.
         Write-N2SMessage "`nRecords per table:" -Level Step
         foreach ($table in $migrationResult.RecordsInserted.Keys | Sort-Object) {
-            Write-N2SMessage "  $table : $($migrationResult.RecordsInserted[$table])" -Level Detail
+            Write-N2SMessage "  $table : $($migrationResult.RecordsInserted[$table])" -Level Info
         }
 
         # Values that did not fit their column, so nothing disappears unnoticed
@@ -1135,7 +1338,8 @@ To ensure that all database connections are correctly configured and operational
         if ($migrationResult.Errors.Count -gt 0) {
             Write-N2SMessage "`nErrors encountered:" -Level Error
             $migrationResult.Errors | ForEach-Object {
-                Write-N2SMessage "  Document $($_.Document): $($_.Error)" -Level Error
+                # Every entry names what failed: a document, a batch or a table
+                Write-N2SMessage "  $($_.Document): $($_.Error)" -Level Error
             }
         }
         
@@ -1584,8 +1788,9 @@ function ConvertTo-FlatRow {
 
     .DESCRIPTION
     Deeper sub-documents are flattened with a dotted column name, which matches
-    the column names generated for nested objects. Arrays inside a sub-document
-    are skipped: they have no table of their own.
+    the column names generated for nested objects. Collections inside a
+    sub-document are skipped here: those get a table of their own, filled by
+    Add-NestedCollectionRow.
     #>
 
     param (
@@ -1938,6 +2143,146 @@ function Get-ConvertedChildValue {
     return [DBNull]::Value
 }
 
+function Add-NestedCollectionRow {
+    <#
+    .SYNOPSIS
+    Writes the collections that sit inside one record of a child table
+
+    .DESCRIPTION
+    Called per record of a child table. Every field of that record holding a
+    collection is looked up as a table named <child table>_<field>. Whether such a
+    table exists, and whether it carries a parent_key column, is what decides: the
+    shape of the database says what to do, so this needs no second judgement about
+    the data.
+
+    .PARAMETER ParentKey
+    Key or position of the record these rows belong to.
+
+    .PARAMETER Cleaned
+    Tables whose old rows for this document were already removed. Removing them
+    once per document instead of once per record matters: without a buffer the
+    second record would otherwise delete the rows of the first.
+
+    .PARAMETER Prefix
+    Path travelled through the sub-documents of the record, so a collection deeper
+    down is found as well: an event holds a geo object and that object holds the
+    coordinates. The path is built exactly as ConvertTo-FlatRow builds its column
+    names, so the table the schema generated and the table looked up here cannot
+    drift apart - and that is what left those tables empty.
+    #>
+
+    param (
+        $Connection,
+        [string]$ChildTable,
+        [string]$MainKeyColumn,
+        $MainId,
+        [string]$ParentKey,
+        $Record,
+        [hashtable]$Cleaned,
+        [string]$DatabaseType,
+        [string]$Prefix = ""
+    )
+
+    $rowsWritten = 0
+
+    foreach ($property in (Get-DocumentProperty -Document $Record)) {
+        $value = $property.Value
+
+        if ($null -eq $value) { continue }
+
+        # A record stays a set of columns; only a collection moves to its own table
+        $isMap = Test-IsDocumentMap -Value $value
+        $isArray = (-not (Test-IsDocumentObject -Value $value)) -and
+                   ($value -is [System.Collections.IEnumerable]) -and ($value -isnot [string])
+
+        if (-not ($isMap -or $isArray)) {
+            # Not a collection itself, but a record can hold one deeper down
+            if (Test-IsDocumentObject -Value $value) {
+                $rowsWritten += Add-NestedCollectionRow -Connection $Connection `
+                                                       -ChildTable $ChildTable `
+                                                       -MainKeyColumn $MainKeyColumn `
+                                                       -MainId $MainId `
+                                                       -ParentKey $ParentKey `
+                                                       -Record $value `
+                                                       -Cleaned $Cleaned `
+                                                       -DatabaseType $DatabaseType `
+                                                       -Prefix "$Prefix$($property.Name)."
+            }
+
+            continue
+        }
+
+        $nestedTable = "${ChildTable}_${Prefix}$($property.Name)"
+        $nestedColumns = Get-SQLTableColumns -Connection $Connection -TableName $nestedTable
+
+        if ($nestedColumns.Count -eq 0 -or -not $nestedColumns.ContainsKey('parent_key')) {
+            continue
+        }
+
+        if (-not $Cleaned.ContainsKey($nestedTable)) {
+            $Cleaned[$nestedTable] = $true
+
+            if (Test-SQLRowBufferActive) {
+                Add-BufferedDelete -TableName $nestedTable -KeyColumn $MainKeyColumn -ParentId $MainId
+            }
+            else {
+                $delete = $Connection.CreateCommand()
+                $delete.CommandText = 'DELETE FROM `' + $nestedTable + '` WHERE `' + $MainKeyColumn + '` = ?'
+                $deleteParam = $delete.CreateParameter()
+                $deleteParam.Value = $MainId
+                $delete.Parameters.Add($deleteParam) | Out-Null
+                $delete.ExecuteNonQuery() | Out-Null
+            }
+        }
+
+        # A map keeps its key, an array its position
+        $entries = if ($isMap) { @(Get-DocumentProperty -Document $value) } else { @($value) }
+        $index = 0
+
+        foreach ($entry in $entries) {
+            $item = if ($isMap) { $entry.Value } else { $entry }
+
+            $row = [ordered]@{}
+            $row[$MainKeyColumn] = $MainId
+            $row['parent_key'] = $ParentKey
+
+            if ($isMap -and $nestedColumns.ContainsKey('map_key')) {
+                $row['map_key'] = "$($entry.Name)"
+            }
+            elseif ($nestedColumns.ContainsKey('array_index')) {
+                $row['array_index'] = $index
+            }
+
+            if (Test-IsDocumentObject -Value $item) {
+                foreach ($field in (ConvertTo-FlatRow -Object $item).GetEnumerator()) {
+                    if ($nestedColumns.ContainsKey($field.Key)) {
+                        $row[$field.Key] = Get-ConvertedChildValue -Value $field.Value `
+                                                                  -ColumnType $nestedColumns[$field.Key] `
+                                                                  -ChildTable $nestedTable `
+                                                                  -ParentId $MainId `
+                                                                  -FieldName $field.Key `
+                                                                  -DatabaseType $DatabaseType
+                    }
+                }
+            }
+            elseif ($nestedColumns.ContainsKey('value')) {
+                $row['value'] = Get-ConvertedChildValue -Value $item `
+                                                        -ColumnType $nestedColumns['value'] `
+                                                        -ChildTable $nestedTable `
+                                                        -ParentId $MainId `
+                                                        -FieldName 'value' `
+                                                        -DatabaseType $DatabaseType
+            }
+
+            Add-SQLRow -Connection $Connection -TableName $nestedTable -Row $row
+            $rowsWritten++
+            $index++
+        }
+    }
+
+    return $rowsWritten
+}
+
 function Invoke-ChildTableMigration {
     <#
     .SYNOPSIS
@@ -1975,7 +2320,39 @@ function Invoke-ChildTableMigration {
 
     $rowsWritten = 0
 
-    if (Test-IsDocumentObject -Value $Value) {
+    # Child tables of this child table, cleaned once per document
+    $cleanedNested = @{}
+
+    if ((Test-IsDocumentObject -Value $Value) -and $childColumns.ContainsKey('map_key')) {
+        # A sub-document whose keys are ids: one row per key. The table says so
+        # itself by having a map_key column, so the writer needs no second
+        # judgement about the shape of the data.
+        foreach ($entry in (Get-DocumentProperty -Document $Value)) {
+            $row = [ordered]@{}
+            $row[$ParentKeyColumn] = $ParentId
+            $row['map_key'] = "$($entry.Name)"
+
+            foreach ($field in (ConvertTo-FlatRow -Object $entry.Value).GetEnumerator()) {
+                if ($childColumns.ContainsKey($field.Key)) {
+                    $row[$field.Key] = Get-ConvertedChildValue -Value $field.Value `
+                                                              -ColumnType $childColumns[$field.Key] `
+                                                              -ChildTable $ChildTable `
+                                                              -ParentId $ParentId `
+                                                              -FieldName $field.Key `
+                                                              -DatabaseType $DatabaseType
+                }
+            }
+
+            Add-SQLRow -Connection $Connection -TableName $ChildTable -Row $row
+            $rowsWritten++
+
+            $rowsWritten += Add-NestedCollectionRow -Connection $Connection -ChildTable $ChildTable `
+                                                    -MainKeyColumn $ParentKeyColumn -MainId $ParentId `
+                                                    -ParentKey "$($entry.Name)" -Record $entry.Value `
+                                                    -Cleaned $cleanedNested -DatabaseType $DatabaseType
+        }
+    }
+    elseif (Test-IsDocumentObject -Value $Value) {
         # Sub-document: exactly one child row
         $row = [ordered]@{}
         $row[$ParentKeyColumn] = $ParentId
@@ -2029,6 +2406,14 @@ function Invoke-ChildTableMigration {
 
             Add-SQLRow -Connection $Connection -TableName $ChildTable -Row $row
             $rowsWritten++
+
+            if (Test-IsDocumentObject -Value $item) {
+                $rowsWritten += Add-NestedCollectionRow -Connection $Connection -ChildTable $ChildTable `
+                                                        -MainKeyColumn $ParentKeyColumn -MainId $ParentId `
+                                                        -ParentKey "$index" -Record $item `
+                                                        -Cleaned $cleanedNested -DatabaseType $DatabaseType
+            }
+
             $index++
         }
     }
@@ -2543,7 +2928,10 @@ function New-SQLSchema {
         Write-N2SMessage "Generating array table: $arrayTableName" -Level Success
         
         $arrayInfo = $arrayFields[$arrayPath]
-        
+
+        # Collections that sit inside the records of this collection. filled below
+        $nestedCollections = @{}
+
         # Determine if array contains objects or primitives
         $hasObjects = $false
         if ($arrayInfo.ArrayElementTypes.ContainsKey('object')) {
@@ -2555,18 +2943,34 @@ function New-SQLSchema {
             # (-like is not usable here: [] is a wildcard character class)
             $arrayObjectFields = @{}
             $arrayPrefix = "$arrayPath[]."
+
             foreach ($fieldPath in $Schema.Keys) {
-                if ($fieldPath.StartsWith($arrayPrefix)) {
-                    $shortName = $fieldPath.Substring($arrayPrefix.Length)
-                    $arrayObjectFields[$shortName] = $Schema[$fieldPath]
+                if (-not $fieldPath.StartsWith($arrayPrefix)) { continue }
+
+                $shortName = $fieldPath.Substring($arrayPrefix.Length)
+
+                # A collection inside these records gets a table of its own, so
+                # neither the collection itself nor the fields of its records are
+                # columns here. Without this they became columns that no row ever
+                # fills, and the [] in their path turned into a backtick in the
+                # column name.
+                if ($shortName -match '\[\]') { continue }
+
+                if ($Schema[$fieldPath].IsArray) {
+                    $nestedCollections[$shortName] = $Schema[$fieldPath]
+                    continue
                 }
+
+                $arrayObjectFields[$shortName] = $Schema[$fieldPath]
             }
             
             $arrayTableSQL = New-ArrayObjectTableDefinition -TableName $arrayTableName `
                                                             -ParentTable $TableName `
                                                             -ParentKeyField $PrimaryKeyField `
                                                             -Fields $arrayObjectFields `
-                                                            -IncludeDrop $IncludeDropStatements
+                                                            -IncludeDrop $IncludeDropStatements `
+                                                            -IsMap ([bool]$arrayInfo.IsMap) `
+                                                            -MaxKeyLength ([int]$arrayInfo.MaxKeyLength)
         }
         else {
             # Array of primitives
@@ -2580,8 +2984,52 @@ function New-SQLSchema {
         $result.Tables += $arrayTableName
         $result.Statements += $arrayTableSQL
         $result.Relationships += "$arrayTableName -> $TableName (${PrimaryKeyField})"
+
+        # A collection inside these records: its own table, tied to the record it
+        # belongs to by the document id plus the key of that record. Not by the id
+        # column of the parent table: that is generated by the database and the
+        # rows are written in one multi row statement, so it is not known here.
+        foreach ($nestedName in ($nestedCollections.Keys | Sort-Object)) {
+            $nestedTableName = "${arrayTableName}_${nestedName}"
+            $nestedPrefix = "$arrayPath[].$nestedName[]."
+            $nestedFields = @{}
+            $tooDeep = $false
+
+            foreach ($fieldPath in $Schema.Keys) {
+                if (-not $fieldPath.StartsWith($nestedPrefix)) { continue }
+
+                $shortName = $fieldPath.Substring($nestedPrefix.Length)
+
+                if ($shortName -match '\[\]') {
+                    $tooDeep = $true
+                    continue
+                }
+
+                $nestedFields[$shortName] = $Schema[$fieldPath]
+            }
+
+            Write-N2SMessage "Generating nested collection table: $nestedTableName" -Level Success
+
+            if ($tooDeep) {
+                Write-N2SMessage "  '$arrayPath.$nestedName' holds a collection of its own; that third level is not migrated" -Level Warning
+            }
+
+            $result.Tables += $nestedTableName
+            $result.Statements += New-NestedCollectionTableDefinition -TableName $nestedTableName `
+                                                                     -MainTable $TableName `
+                                                                     -MainKeyField $PrimaryKeyField `
+                                                                     -Fields $nestedFields `
+                                                                     -ArrayInfo $nestedCollections[$nestedName] `
+                                                                     -IncludeDrop $IncludeDropStatements
+            $result.Relationships += "$nestedTableName -> $arrayTableName (parent_key)"
+        }
     }
     
+    # MySQL refuses a CREATE TABLE whose row can grow past 65535 bytes, and a
+    # VARCHAR(255) in utf8mb4 already costs 1021 of them. A wide table gets its
+    # longest text columns turned into LONGTEXT so it can be created at all.
+    $result.Statements = @($result.Statements | ForEach-Object { Convert-WideColumnToText -SQLText $_ })
+
     # Display summary
     Write-N2SMessage "`n═══════════════════════════════════════════════════════" -Level Header
     Write-N2SMessage "Schema Generation Complete!" -Level Success
@@ -2702,38 +3150,55 @@ function New-NestedTableDefinition {
 function New-ArrayObjectTableDefinition {
     <#
     .SYNOPSIS
-    Creates SQL for an array of objects table
+    Creates SQL for a table holding the objects of an array, or of a map
+
+    .PARAMETER IsMap
+    The source is a sub-document whose keys are ids (see Test-IsDocumentMap). The
+    row then keeps that key instead of a position in an array.
+
+    .PARAMETER MaxKeyLength
+    Longest key seen, so the map_key column fits.
     #>
-    
+
     param (
         [string]$TableName,
         [string]$ParentTable,
         [string]$ParentKeyField,
         [hashtable]$Fields,
-        [bool]$IncludeDrop
+        [bool]$IncludeDrop,
+        [bool]$IsMap = $false,
+        [int]$MaxKeyLength = 0
     )
-    
+
     $sql = ""
-    
+
     if ($IncludeDrop) {
         $sql += "`n-- Drop table if exists`n"
         $sql += "IF OBJECT_ID('$TableName', 'U') IS NOT NULL DROP TABLE [$TableName];`n`n"
     }
-    
-    $sql += "-- Array of objects table: $TableName`n"
+
+    $sql += if ($IsMap) { "-- Map of objects table: $TableName`n" } else { "-- Array of objects table: $TableName`n" }
     $sql += "CREATE TABLE [$TableName] (`n"
-    
+
     $columns = @()
-    
+
     # Add ID column
     $columns += "    [id] INT IDENTITY(1,1) PRIMARY KEY"
-    
+
     # Add foreign key to parent
     $columns += "    [${ParentTable}_${ParentKeyField}] VARCHAR(255) NOT NULL"
-    
-    # Add array index
-    $columns += "    [array_index] INT NOT NULL"
-    
+
+    if ($IsMap) {
+        # The key of the sub-document is data and belongs in a column. It is what
+        # identifies the row, so it is not allowed to disappear.
+        $keySize = if ($MaxKeyLength -gt 255) { 1000 } else { 255 }
+        $columns += "    [map_key] VARCHAR($keySize) NOT NULL"
+    }
+    else {
+        # Add array index
+        $columns += "    [array_index] INT NOT NULL"
+    }
+
     # Add fields from array objects
     foreach ($fieldName in ($Fields.Keys | Sort-Object)) {
         $fieldInfo = $Fields[$fieldName]
@@ -2791,7 +3256,7 @@ function New-ArrayPrimitiveTableDefinition {
 
     if ($elementTypes.Count -eq 1) {
         switch ($elementTypes[0]) {
-            'integer'  { $valueType = "INT" }
+            'integer'  { $valueType = Get-SQLIntegerType -FieldInfo $ArrayInfo }
             'number'   { $valueType = "DECIMAL(18,2)" }
             'boolean'  { $valueType = "BIT" }
             'datetime' { $valueType = "DATETIME2" }
@@ -2819,6 +3284,121 @@ function New-ArrayPrimitiveTableDefinition {
     $sql += ");`n"
     
     return $sql
+}
+
+function New-NestedCollectionTableDefinition {
+    <#
+    .SYNOPSIS
+    Creates SQL for a collection that sits inside the records of another collection
+
+    .DESCRIPTION
+    An export from Firebase nests further than one level: every refuel holds an
+    array of repayments. Such a collection cannot be a column of its parent table,
+    and it needs a row of its own per entry.
+
+    The row points at its parent with two columns: the id of the document, and
+    parent_key, the key or the position of the record it belongs to. Deliberately
+    not the id column of the parent table: that one is filled in by the database
+    while a whole batch of rows is written in one statement, so it is not available
+    at the moment these rows are built.
+
+    .PARAMETER Fields
+    Fields of the records in this collection. Empty for a collection of plain
+    values, which then gets a single value column.
+
+    .PARAMETER ArrayInfo
+    The schema entry of the collection, for IsMap and the length of the values.
+    #>
+
+    param (
+        [string]$TableName,
+        [string]$MainTable,
+        [string]$MainKeyField,
+        [hashtable]$Fields,
+        $ArrayInfo,
+        [bool]$IncludeDrop
+    )
+
+    $sql = ""
+
+    if ($IncludeDrop) {
+        $sql += "`n-- Drop table if exists`n"
+        $sql += "IF OBJECT_ID('$TableName', 'U') IS NOT NULL DROP TABLE [$TableName];`n`n"
+    }
+
+    $sql += "-- Nested collection table: $TableName`n"
+    $sql += "CREATE TABLE [$TableName] (`n"
+
+    $columns = @()
+    $columns += "    [id] INT IDENTITY(1,1) PRIMARY KEY"
+    $columns += "    [${MainTable}_${MainKeyField}] VARCHAR(255) NOT NULL"
+    $columns += "    [parent_key] VARCHAR(255) NOT NULL"
+
+    if ($ArrayInfo.IsMap) {
+        $columns += "    [map_key] VARCHAR(255) NOT NULL"
+    }
+    else {
+        $columns += "    [array_index] INT NOT NULL"
+    }
+
+    if ($Fields.Keys.Count -eq 0) {
+        # A collection of plain values: one column holding the value. Unbounded,
+        # because the analysis of a nested collection sees fewer values than a top
+        # level one and a length taken from that would be a guess.
+        $columns += "    [value] VARCHAR(MAX)"
+    }
+    else {
+        foreach ($fieldName in ($Fields.Keys | Sort-Object)) {
+            $sqlType = Convert-MongoTypeToSQL -FieldInfo $Fields[$fieldName] -FieldName $fieldName
+            $columns += "    [$fieldName] $sqlType"
+        }
+    }
+
+    $sql += ($columns -join ",`n")
+    $sql += ",`n"
+    $sql += "    FOREIGN KEY ([${MainTable}_${MainKeyField}]) REFERENCES [$MainTable]([$MainKeyField])`n"
+    $sql += ");`n"
+
+    return $sql
+}
+
+function Get-SQLIntegerType {
+    <#
+    .SYNOPSIS
+    Chooses between INT and BIGINT for the whole numbers that were seen
+
+    .DESCRIPTION
+    INT stops at 2147483647, and a timestamp in milliseconds (1767184524000) is a
+    whole number that goes well past it. MySQL then refuses the row with "Out of
+    range value for column", so a single field costs the whole table its data. The
+    column is therefore sized on the largest and the smallest value the analysis
+    saw, exactly as the length of a text column is.
+
+    A value outside the sample can still be larger. That is the same limitation as
+    for text, and the conversion layer reports such a value instead of losing the
+    document over it.
+
+    .PARAMETER FieldInfo
+    Schema entry of the field, with MaxInteger and MinInteger.
+    #>
+
+    param (
+        $FieldInfo
+    )
+
+    $max = [int64]0
+    $min = [int64]0
+
+    if ($null -ne $FieldInfo) {
+        if ($null -ne $FieldInfo.MaxInteger) { $max = [int64]$FieldInfo.MaxInteger }
+        if ($null -ne $FieldInfo.MinInteger) { $min = [int64]$FieldInfo.MinInteger }
+    }
+
+    if ($max -gt [int]::MaxValue -or $min -lt [int]::MinValue) {
+        return "BIGINT"
+    }
+
+    return "INT"
 }
 
 function Convert-MongoTypeToSQL {
@@ -2873,7 +3453,7 @@ function Convert-MongoTypeToSQL {
             return "VARCHAR($maxLength)"
         }
         "integer" {
-            return "INT"
+            return (Get-SQLIntegerType -FieldInfo $FieldInfo)
         }
         "number" {
             return "DECIMAL(18,2)"
@@ -2894,6 +3474,132 @@ function Convert-MongoTypeToSQL {
             return "VARCHAR(MAX)"
         }
     }
+}
+
+function Get-SQLColumnRowBytes {
+    <#
+    .SYNOPSIS
+    Estimates how much room one column definition takes in a MySQL row
+
+    .DESCRIPTION
+    MySQL keeps every row within 65535 bytes and counts VARCHAR in full, so the
+    limit is reached far sooner than the number of columns suggests. The numbers
+    below are the utf8mb4 worst case: four bytes per character plus the length
+    prefix. Text and blob columns live outside the row and only cost a pointer,
+    which is why turning a wide column into LONGTEXT frees so much.
+
+    .PARAMETER ColumnDefinition
+    One line of a CREATE TABLE, for example "    [title] VARCHAR(255)".
+    #>
+
+    param (
+        [string]$ColumnDefinition
+    )
+
+    # A bounded text column: this is what fills a row
+    if ($ColumnDefinition -match '\bN?VARCHAR\s*\(\s*(\d+)\s*\)') {
+        $bytes = [int]$matches[1] * 4
+        if ($bytes -ge 256) { return $bytes + 2 }
+        return $bytes + 1
+    }
+
+    # Stored outside the row
+    if ($ColumnDefinition -match '\b(LONGTEXT|MEDIUMTEXT|TEXT|BLOB)\b' -or
+        $ColumnDefinition -match '\bN?VARCHAR\s*\(\s*MAX\s*\)') { return 12 }
+
+    if ($ColumnDefinition -match '\bBIGINT\b') { return 8 }
+    if ($ColumnDefinition -match '\bDECIMAL\b') { return 9 }
+    if ($ColumnDefinition -match '\b(BIT|TINYINT)\b') { return 1 }
+    if ($ColumnDefinition -match '\bDATETIME2?\b') { return 8 }
+    if ($ColumnDefinition -match '\bDATE\b') { return 3 }
+    if ($ColumnDefinition -match '\bINT\b') { return 4 }
+
+    return 8
+}
+
+function Convert-WideColumnToText {
+    <#
+    .SYNOPSIS
+    Turns text columns into unbounded text until the row fits MySQL's limit
+
+    .DESCRIPTION
+    A VARCHAR(255) costs 1021 bytes in utf8mb4, so about 64 of them already fill
+    the 65535 bytes MySQL allows per row and CREATE TABLE fails with "Row size
+    too large". The widest text columns are converted to VARCHAR(MAX), which
+    becomes LONGTEXT in MySQL and only costs a pointer in the row. Nothing is
+    lost by it: the column holds more, not less.
+
+    Key columns keep their length. A LONGTEXT cannot be a primary key nor the
+    target of a foreign key, and those are exactly the columns marked NOT NULL by
+    the table builders.
+
+    .PARAMETER SQLText
+    One statement block from the table builders, DROP and CREATE together.
+
+    .PARAMETER MaxRowBytes
+    Budget to stay below. Deliberately under 65535, because this estimate cannot
+    know the overhead the storage engine adds per row.
+    #>
+
+    param (
+        [string]$SQLText,
+
+        [int]$MaxRowBytes = 60000
+    )
+
+    if ([string]::IsNullOrWhiteSpace($SQLText) -or $SQLText -notmatch 'CREATE TABLE') {
+        return $SQLText
+    }
+
+    $lines = @($SQLText -split "`n")
+    $rowBytes = 0
+    $candidates = @()
+
+    for ($index = 0; $index -lt $lines.Count; $index++) {
+        $line = $lines[$index]
+
+        # Only column lines cost room; comments and the CREATE itself do not
+        if ($line -notmatch '^\s*\[') { continue }
+
+        $rowBytes += Get-SQLColumnRowBytes -ColumnDefinition $line
+
+        if ($line -match 'PRIMARY KEY' -or $line -match 'NOT NULL') { continue }
+
+        if ($line -match '\bN?VARCHAR\s*\(\s*(\d+)\s*\)') {
+            $candidates += [PSCustomObject]@{ Index = $index; Characters = [int]$matches[1] }
+        }
+    }
+
+    if ($rowBytes -le $MaxRowBytes) {
+        return $SQLText
+    }
+
+    $tableName = 'unknown'
+    if ($SQLText -match 'CREATE TABLE\s+\[?([^\]\s(]+)') {
+        $tableName = $matches[1]
+    }
+
+    # Widest first: that frees the most room per column changed
+    $promoted = 0
+
+    foreach ($candidate in ($candidates | Sort-Object Characters -Descending)) {
+        if ($rowBytes -le $MaxRowBytes) { break }
+
+        $freed = Get-SQLColumnRowBytes -ColumnDefinition $lines[$candidate.Index]
+        $lines[$candidate.Index] = $lines[$candidate.Index] -replace '\bN?VARCHAR\s*\(\s*\d+\s*\)', 'VARCHAR(MAX)'
+        $rowBytes = $rowBytes - $freed + 12
+        $promoted++
+    }
+
+    if ($promoted -gt 0) {
+        Write-N2SMessage "  Table $tableName does not fit in one MySQL row: $promoted text column(s) become LONGTEXT" -Level Warning
+    }
+
+    if ($rowBytes -gt $MaxRowBytes) {
+        Write-N2SMessage "  Table $tableName still needs about $rowBytes bytes per row while MySQL allows 65535; it has too many columns" -Level Warning
+    }
+
+    return ($lines -join "`n")
 }
 
 function Export-SQLSchema {
@@ -3756,7 +4462,9 @@ function Start-IncrementalSync {
                      -DatabaseName $config.MongoDB.Database `
                      -CollectionName $TableName
         
-        $mongoDocuments = Get-MdbcData
+        # Wrapped: a single document comes back as a dictionary, whose .Count is
+        # the number of fields. That reported "4 documents" for one document.
+        $mongoDocuments = @(Get-MdbcData)
         Write-N2SMessage " MongoDB: $($mongoDocuments.Count) documents" -Level Success
         
         # SQL
@@ -4422,7 +5130,11 @@ function Get-ChildTableMap {
     foreach ($candidate in $candidates) {
         $columns = Get-SQLTableColumns -Connection $Connection -TableName $candidate
 
-        if ($columns.ContainsKey($parentKeyColumn)) {
+        # A table with a parent_key column belongs to a record of a child table,
+        # not to a field of the document. Counting it here would give it a field
+        # name that no document has, so a sync would see drift on every run and the
+        # cleanup would offer it as a leftover table.
+        if ($columns.ContainsKey($parentKeyColumn) -and -not $columns.ContainsKey('parent_key')) {
             $fieldName = $candidate.Substring($TableName.Length + 1)
             $childTables[$fieldName] = $candidate
         }
@@ -4481,6 +5193,11 @@ function Get-ExpectedChildRowCount {
 
     if ($null -eq $value) {
         return 0
+    }
+
+    # A sub-document whose keys are ids gives a row per key, not a single row
+    if (Test-IsDocumentMap -Value $value) {
+        return @(Get-DocumentProperty -Document $value).Count
     }
 
     if (Test-IsDocumentObject -Value $value) {
@@ -4647,7 +5364,7 @@ function Update-SQLSchema {
     try {
         # Get existing SQL columns
         $cmd = $Connection.CreateCommand()
-        $cmd.CommandText = "SHOW COLUMNS FROM " + $TableName
+        $cmd.CommandText = 'SHOW COLUMNS FROM `' + $TableName + '`'
         $reader = $cmd.ExecuteReader()
         
         $existingColumns = @{}
@@ -4694,8 +5411,10 @@ function Update-SQLSchema {
             foreach ($column in $missingColumns) {
                 $dataType = Get-SQLDataType -Value $column.SampleValue -DatabaseType $DatabaseType
                 
-                # Add column as NULLABLE to allow missing values in existing/new records
-                $alterSQL = "ALTER TABLE " + $TableName + " ADD COLUMN " + $column.Name + " " + $dataType + " NULL"
+                # Add column as NULLABLE to allow missing values in existing/new
+                # records. Table and column quoted: both can start with a digit or
+                # be a reserved word.
+                $alterSQL = 'ALTER TABLE `' + $TableName + '` ADD COLUMN `' + $column.Name + '` ' + $dataType + ' NULL'
                 
                 $cmd = $Connection.CreateCommand()
                 $cmd.CommandText = $alterSQL
@@ -4740,7 +5459,14 @@ function Get-SQLDataType {
             }
             return "VARCHAR(255)"
         }
-        "Int*" { return "INT" }
+        "Int*" {
+            # A column added during a sync is sized on the value at hand, and a
+            # timestamp in milliseconds does not fit in INT
+            if ([int64]$Value -gt [int]::MaxValue -or [int64]$Value -lt [int]::MinValue) {
+                return "BIGINT"
+            }
+            return "INT"
+        }
         "Double" { return "DECIMAL(18,2)" }
         "Float" { return "DECIMAL(18,2)" }
         "Decimal" { return "DECIMAL(18,2)" }
@@ -4764,24 +5490,30 @@ function Get-AllSQLRecords {
     )
     
     $records = @{}
-    
+
     try {
         $cmd = $Connection.CreateCommand()
-        $cmd.CommandText = "SELECT _id FROM " + $TableName
-        
+
+        # Quoted: a table name may start with a digit or hold a reserved word, and
+        # unquoted "SELECT _id FROM 20" is a syntax error
+        $cmd.CommandText = 'SELECT `_id` FROM `' + $TableName + '`'
+
         $reader = $cmd.ExecuteReader()
-        
+
         while ($reader.Read()) {
             $id = $reader.GetString(0)
             $records[$id] = $true
         }
-        
+
         $reader.Close()
     }
     catch {
-        Write-N2SMessage "Error loading SQL records: $($_.Exception.Message)" -Level Error
+        # Not catchable here: an empty list means "nothing in SQL yet" to the
+        # caller, so it would insert every document again and run into duplicate
+        # keys. The sync has to stop instead.
+        throw "Could not read the existing rows of table '$TableName': $($_.Exception.Message)"
     }
-    
+
     return $records
 }
 
@@ -5607,6 +6339,20 @@ function Get-CollectionResultStatus {
         if ($migration.FailedDocuments -gt 0) {
             $status.Success = $false
             $status.Reason = "$($migration.FailedDocuments) of $($migration.TotalDocuments) documents failed to migrate"
+            return $status
+        }
+
+        # Something else went wrong that has nothing to do with a single document,
+        # a table that could not be created for example. Every document can still
+        # have been processed while the data has nowhere to go, so this may not
+        # pass as a success.
+        $migrationErrors = @($migration.Errors | Where-Object { $null -ne $_ } | ForEach-Object {
+            if ($_ -is [System.Collections.IDictionary]) { "$($_.Document) $($_.Error)" } else { "$_" }
+        })
+
+        if ($migrationErrors.Count -gt 0) {
+            $status.Success = $false
+            $status.Reason = "migration reported $($migrationErrors.Count) error(s): " + ($migrationErrors -join '; ')
             return $status
         }
 

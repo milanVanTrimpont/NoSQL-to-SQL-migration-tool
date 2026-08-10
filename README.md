@@ -8,7 +8,9 @@ Developed for the Applied Computer Science program (3rd year, Scripting).
 ## What it does
 
 * **Schema discovery** — analyses a collection and generates `CREATE TABLE`
-  statements, including child tables for arrays and sub-documents.
+  statements, including child tables for arrays and sub-documents. A sub-document
+  whose keys are ids, as in an export from Firebase, becomes one row per key
+  instead of one column per key.
 * **Tolerant conversion** — a field that holds a date in one document and text in
   the next does not cost you a document. Values are converted per column, and a
   value that truly does not fit is reported instead of silently dropped.
